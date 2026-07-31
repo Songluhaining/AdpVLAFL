@@ -1,0 +1,16 @@
+# Data and artefacts live outside version control: the rollout corpus alone is
+# ~8GB and the checkpoints ~38GB.
+rollouts*/
+models/
+robotwin_assets/
+logs/
+*.npz
+*.nc
+*.png
+*.mp4
+*.whl
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.idea/

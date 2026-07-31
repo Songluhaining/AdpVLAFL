@@ -1,0 +1,1215 @@
+diff --git a/deploy/lingbot_vla_v2_policy.py b/deploy/lingbot_vla_v2_policy.py
+index 96b9acb..bde55a6 100644
+--- a/deploy/lingbot_vla_v2_policy.py
++++ b/deploy/lingbot_vla_v2_policy.py
+@@ -28,6 +28,7 @@ import torch.nn.functional as F
+ from lingbotvla.models.vla.lingbot_vla.configuration_lingbot_vla import LingbotVLAV2Config
+ from lingbotvla.models.vla.lingbot_vla.modeling_lingbot_vla_v2 import LingbotVlaV2Policy
+ from lingbotvla.models.vla.lingbot_vla.qwen3vl_in_vla import apply_lingbot_qwen3_vl_patch
++from lingbotvla.models.vla.lingbot_vla import introspect as lingbot_introspect
+ 
+ from lingbotvla.data.vla_data.utils import FeatureTransform
+ from lingbotvla.models import build_processor
+@@ -46,6 +47,14 @@ def set_seed_everywhere(seed: int):
+ 
+ set_seed_everywhere(42)
+ 
++if os.environ.get("LINGBOT_DETERMINISTIC") == "1":
++    # Pinning the sampling noise still leaves ~2e-2 of run-to-run drift in the
++    # action chunk, because reduction order in the fused MoE and attention
++    # kernels is not fixed. Harmless for evaluation, but it breaks the paired
++    # replay an intervention needs, so allow forcing deterministic kernels.
++    torch.use_deterministic_algorithms(True, warn_only=True)
++    torch.backends.cudnn.benchmark = False
++
+ BASE_MODEL_PATH = {
+     'qwen3vl': os.environ.get(
+         'QWEN3VL_PATH',
+@@ -207,6 +216,9 @@ class LingbotVLAv2Server:
+         self.task_description = None
+ 
+         self.use_compile = use_compile
++        # `load_vla` needs to know the target dtype so it can build and load the
++        # weights straight in that dtype instead of materializing an fp32 copy.
++        self.use_bf16 = use_bf16
+         apply_lingbot_qwen3_vl_patch()
+ 
+         self.vla = self.load_vla(path_to_pi_model)
+@@ -225,14 +237,41 @@ class LingbotVLAv2Server:
+         self.action_key: str= "action"
+ 
+     def load_model_weights(self, path_to_pi_model, strict=True):
+-        all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
+-        merged_weights = {}
++        """Load the sharded checkpoint one shard at a time.
+ 
+-        for file_path in tqdm(all_safetensors):
++        The checkpoint is stored in fp32 (~25GB for the 6B model). Merging every
++        shard into a single dict before calling ``load_state_dict`` needs that
++        25GB *on top of* the freshly built model, which does not fit on a 32GB
++        host. Loading shard by shard, casting each tensor to the parameter's own
++        dtype as we go, keeps the peak at one shard.
++        """
++        all_safetensors = sorted(glob(os.path.join(path_to_pi_model, "*.safetensors")))
++        if not all_safetensors:
++            raise FileNotFoundError(f"no *.safetensors under {path_to_pi_model}")
++
++        own_state = self.vla.state_dict()
++        missing = set(own_state.keys())
++        unexpected = []
++
++        for file_path in tqdm(all_safetensors, desc="loading shards"):
++            shard = {}
+             with safe_open(file_path, framework="pt", device="cpu") as f:
+                 for key in f.keys():
+-                    merged_weights[key] = f.get_tensor(key)
+-        self.vla.load_state_dict(merged_weights, strict=strict)
++                    tensor = f.get_tensor(key)
++                    target = own_state.get(key)
++                    if target is not None and target.is_floating_point():
++                        tensor = tensor.to(target.dtype)
++                    shard[key] = tensor
++            result = self.vla.load_state_dict(shard, strict=False)
++            unexpected.extend(result.unexpected_keys)
++            missing -= set(shard.keys())
++            del shard
++
++        if strict and (missing or unexpected):
++            raise RuntimeError(
++                f"checkpoint mismatch: {len(missing)} missing, {len(unexpected)} unexpected. "
++                f"missing e.g. {sorted(missing)[:5]}, unexpected e.g. {sorted(unexpected)[:5]}"
++            )
+ 
+     def merge_qwen_config(self, qwen_config):
+         if hasattr(qwen_config, 'to_dict'):
+@@ -315,7 +354,19 @@ class LingbotVLAv2Server:
+         
+         print('Initializing model ... ')
+ 
+-        self.vla = LingBotVlaV2InferencePolicy(config, eval=True)
++        # Build directly in the inference dtype and move to the GPU before the
++        # weights are read, so host RAM only ever holds a single shard. The
++        # subsequent `.to(bfloat16).cuda()` in __init__ then becomes a no-op.
++        if self.use_bf16:
++            prev_dtype = torch.get_default_dtype()
++            torch.set_default_dtype(torch.bfloat16)
++            try:
++                self.vla = LingBotVlaV2InferencePolicy(config, eval=True)
++            finally:
++                torch.set_default_dtype(prev_dtype)
++            self.vla = self.vla.cuda()
++        else:
++            self.vla = LingBotVlaV2InferencePolicy(config, eval=True)
+ 
+         self.load_model_weights(path_to_pi_model, strict=True)
+         
+@@ -467,6 +518,34 @@ class LingbotVLAv2Server:
+             self.reset(robo_name=observation['robo_name'], path_to_pi_model=observation['path_to_pi_model'] if 'path_to_pi_model' in observation else None)
+             return dict(action = None)
+ 
++        # Let a client ask for the pre-unnormalization chunk over the wire; this
++        # is what the rollout logger records alongside the executed actions.
++        if 'return_normalized' in observation:
++            observation = dict(observation)
++            return_normalized = bool(observation.pop('return_normalized'))
++
++        # Per-decision capture of the model internals the failure-localization
++        # model needs: the sampling noise, the prefix readouts, the MoE routing
++        # and the flow-matching trajectory. Off unless the client asks, and it
++        # never changes the actions that come back.
++        want_introspect = False
++        if 'return_introspect' in observation:
++            observation = dict(observation)
++            want_introspect = bool(observation.pop('return_introspect'))
++
++        # Pin the sampling noise so a scene can be replayed under a changed
++        # setting and any difference in outcome is attributable to that setting.
++        noise_seed = None
++        if 'noise_seed' in observation:
++            observation = dict(observation)
++            noise_seed = observation.pop('noise_seed')
++        lingbot_introspect.set_noise_seed(noise_seed)
++        if want_introspect and self.use_compile:
++            raise RuntimeError(
++                "introspection needs --use_compile False: torch.compile traces "
++                "around the capture hooks and they would silently record nothing"
++            )
++
+         is_batch = 'batch' in observation
+         observations = observation['batch'] if is_batch else [observation]
+         if not self.chunk_ret and self.use_length <= 0:
+@@ -479,8 +558,19 @@ class LingbotVLAv2Server:
+             or self.use_length == -1 
+         )
+ 
++        introspect_out = None
+         if should_forward:
+-            if return_normalized:
++            if want_introspect:
++                with lingbot_introspect.capture() as _cap:
++                    if return_normalized:
++                        unnormalized_actions, normalized_actions = self._infer_batch(
++                            observations, return_normalized=True,
++                        )
++                    else:
++                        unnormalized_actions = self._infer_batch(observations)
++                        normalized_actions = None
++                introspect_out = lingbot_introspect.finalize(_cap)
++            elif return_normalized:
+                 unnormalized_actions, normalized_actions = self._infer_batch(
+                     observations,
+                     return_normalized=True,
+@@ -520,8 +610,18 @@ class LingbotVLAv2Server:
+                 normalized_action = normalized_action[0]
+ 
+         result = action
+-        if return_normalized:
++        if introspect_out:
++            result = dict(result)
++            for k, v in introspect_out.items():
++                result[f"_introspect_{k}"] = v
++        if return_normalized and normalized_action is not None:
+             result = dict(result)
++            # Still a torch tensor at this point; the websocket packer only speaks
++            # numpy, so convert here rather than at every call site.
++            if isinstance(normalized_action, Tensor):
++                normalized_action = normalized_action.detach().to(
++                    dtype=torch.float32, device="cpu"
++                ).numpy()
+             result["_normalized_actions"] = normalized_action
+ 
+         self.global_step += 1
+diff --git a/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py b/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
+index 44ccf04..0f3a2ec 100644
+--- a/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
++++ b/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
+@@ -1,3 +1,25 @@
++# =============================================================================
++# 这个文件是 LingBot-VLA 2.0 的「核心大脑」定义。
++#
++# 一句话概括它在做什么：
++#   输入 = 几张摄像头画面 + 一句话指令（比如「把瓶子放进冰箱」）+ 机器人当前姿态
++#   输出 = 接下来一段时间机器人每个关节要怎么动（一串动作数字）
++#
++# 里面有三个主要角色（从底层到顶层）：
++#   1) QwenvlWithExpertV2Model —— 把「看图说话的大脑(VLM)」和「专门算动作的小脑(动作专家)」
++#      拼在一起，让它们在每一层互相「看一眼、交流一下」。这是真正做计算的地方。
++#   2) FlowMatchingV2 —— 负责「怎么把一团随机噪声，一步步变成正确的动作」，
++#      以及训练时顺便让模型学会「预测画面的深度/预测未来画面」（帮助它更懂空间和变化）。
++#   3) LingbotVlaV2Policy —— 最外层的包装，训练脚本和部署代码直接用的就是它。
++#
++# 几个反复出现的词，先用大白话解释（后面注释里不再重复）：
++#   · token：把图片/文字切成的一小块一小块信息单元，模型是按「块」来处理的。
++#   · embedding（向量）：把一块信息变成一串数字，模型只认数字。
++#   · attention（注意力）：让不同信息块互相「看对方一眼」，从而知道彼此的关系。
++#   · prefix / suffix：前半段(图片+指令) / 后半段(机器人状态+待预测的动作)。
++#   · MoE（专家混合）：准备很多个「小专家」，每次只挑几个来干活，省算力又更专精。
++# =============================================================================
++
+ import einops
+ import torch
+ from torch import Tensor, nn
+@@ -32,6 +54,7 @@ from .utils import (
+     sample_beta,
+ )
+ from .flex_attention import build_block_mask, flex_attention_forward, flex_attention_with_block_mask
++from . import introspect
+ from lingbotvla.models.loader import LingBotVLAWeightLoader
+ from lingbotvla.ops.triton_moe_loss import triton_sequence_wise_balance_loss
+ from lingbotvla.models.vla.lingbot_vla.qwen2_action_expert import (
+@@ -50,6 +73,10 @@ except Exception:
+ logger = logging.get_logger(__name__)
+ 
+ 
++# -----------------------------------------------------------------------------
++# 这是一个「配置表」，只负责记录各种参数（比如动作专家有多少层、多宽），
++# 本身不做任何计算。可以把它理解成一张「规格说明书」，后面真正的模型会照着它来搭。
++# -----------------------------------------------------------------------------
+ class QwenvlWithExpertV2Config(PretrainedConfig):
+     model_type = "QwenvlWithExpertV2Model"
+ 
+@@ -82,8 +109,13 @@ class QwenvlWithExpertV2Config(PretrainedConfig):
+         self.action_num_attention_heads = action_num_attention_heads
+         self.action_num_key_value_heads = action_num_key_value_heads
+         self.action_head_dim = action_head_dim
++        # 动作专家（算动作的那个小脑）固定用 36 层。
++        # 这里要和「看图说话的大脑」层数保持一致，因为后面它们要一层一层配对着交流。
+         num_layers = 36
+ 
++        # 下面这一大坨是在给「动作专家」写一份标准的 Qwen2 模型规格
++        # （层数、宽度、注意力头数等）。这些是常见的网络超参数，照抄即可，
++        # 关键就是 hidden_size(网络宽度) 和 num_hidden_layers(层数=36)。
+         self.qwen_expert_config = CONFIG_MAPPING["qwen2"](
+             attention_dropout=0.0,
+             bos_token_id=151643,
+@@ -118,12 +150,21 @@ class QwenvlWithExpertV2Config(PretrainedConfig):
+         super().__init__(**kwargs)
+ 
+ 
++# =============================================================================
++# 【核心类之一】把两个大脑拼在一起：
++#   · self.qwenvl      —— 看图说话的大脑(VLM)，负责理解画面和指令。
++#   · self.qwen_expert —— 算动作的小脑(动作专家)，负责把理解转成机器人动作。
++#
++# 关键设计：这两个大脑「层数一样」，计算时一层一层同步走；每一层里，画面/文字信息
++# 和动作信息会通过「注意力」互相看一眼。这样动作专家在算动作时，随时能参考画面理解。
++# =============================================================================
+ class QwenvlWithExpertV2Model(PreTrainedModel):
+     config_class = QwenvlWithExpertV2Config
+ 
+     def __init__(self, config: QwenvlWithExpertV2Config, eval=False):
+         super().__init__(config=config)
+         self.config = config
++        # 第 1 步：搭建「看图说话的大脑」(Qwen3-VL)。tokenizer_path 指向它的规格与词表。
+         vlm_config = AutoConfig.from_pretrained(self.config.tokenizer_path)
+         if self.config.vocab_size not in (0, 257152):
+             vlm_config.text_config.vocab_size = self.config.vocab_size
+@@ -134,9 +175,12 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+         if self.config.use_lm_head:
+             self.qwenvl.tie_weights()
+ 
++        # 第 2 步：搭建「算动作的小脑」(动作专家)，规格来自上面那份说明书。
+         self.config.qwen_expert_config._attn_implementation = "flash_attention_2"
+         self.qwen_expert = Qwen2ForCausalLM._from_config(self.config.qwen_expert_config, eval=eval)
+ 
++        # 可选：把动作专家里的「归一化层」换成能吃「时间信息」的版本。
++        # （flow matching 里有个「当前进度到哪一步了」的时间量，这样能把它注入到每一层。）
+         if getattr(self.config, "adanorm_time", False):
+             replace_lnorm_with_adanorm(
+                 self.qwen_expert,
+@@ -145,14 +189,18 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+                 config.final_norm_adanorm,
+             )
+ 
++        # 第 3 步：如果开启了 MoE，就把动作专家里指定层的「普通前馈网络」换成「一群专家」。
+         self._install_moe_blocks()
++        # 下面这些先占位为空，是给「固定分辨率训练时缓存的中间结果」用的（加速用，见 get_image_features）。
+         self.pos_embeds = None
+         self.position_embeddings = None
+         self.cu_seqlens = None
+         self.visual_split_sizes = None
+         self.visual_max_seqlen = None
+ 
++        # 动作专家不需要自己的「文字查表」模块（它不处理文字），删掉省显存。
+         del self.qwen_expert.model.embed_tokens
++        # 可选：给动作专家额外配一只「眼睛」(DINOv3)。默认不开。
+         if self.config.enable_expert_vision:
+             if dinov3_vitb16 is None:
+                 raise ImportError("dinov3 is required when enable_expert_vision=True")
+@@ -164,12 +212,15 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+                 nn.Linear(self.expert_visual.embed_dim * 2, self.config.qwen_expert_config.hidden_size),
+             )
+ 
++        # 选定注意力的具体算法实现（flex / eager 等），并按配置冻结部分参数（不参与训练）。
+         self.attention_interface = self.get_attention_interface()
+         self.set_requires_grad()
+ 
++    # 把动作专家里指定层的「前馈网络」替换成 MoE（一群专家）版本。
++    # MoE 的好处：模型总容量变大、每个专家更专精，但每次只激活少数几个，算力不怎么涨。
+     def _install_moe_blocks(self):
+         if not getattr(self.config, "use_moe", False):
+-            return
++            return  # 没开 MoE 就什么都不做
+         bias_update_speed = getattr(self.config, "bias_update_speed", 0.001)
+         hidden_size = self.config.qwen_expert_config.hidden_size
+         token_moe_layers = getattr(self.config, "token_moe_layers", None) or []
+@@ -191,9 +242,11 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+             token_config.router_activation = getattr(self.config, "router_activation", "softmax")
+             token_config.routed_scaling_factor = getattr(self.config, "routed_scaling_factor", 1.0)
+             token_config.use_shared_expert_gate = getattr(self.config, "use_shared_expert_gate", True)
++            # 逐层把 .mlp（普通前馈网络）换成 MoE 版本（一群专家 + 一个负责挑选的「路由器」）。
+             for idx in token_moe_layers:
+                 self.qwen_expert.model.layers[idx].mlp = Qwen2TokenMoeBlock(token_config)
+ 
++    # 按配置决定哪些部分「冻结」（requires_grad=False 表示训练时不更新它，省算力、防遗忘）。
+     def set_requires_grad(self):
+         if self.config.freeze_vision_encoder:
+             self.qwenvl.visual.eval()
+@@ -211,11 +264,15 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+         if self.config.train_expert_only:
+             self.qwenvl.eval()
+ 
++    # 把「原始图片像素」交给 VLM 的视觉部分，得到一串代表画面内容的数字(图像 token)。
++    # image_grid_thw 记录每张图被切成了几行几列的小块，模型据此知道怎么把这串数字排回二维。
+     def get_image_features(
+         self,
+         pixel_values: torch.FloatTensor,
+         image_grid_thw: torch.LongTensor,
+     ):
++        # precompute_grid_thw：如果每张图分辨率都固定，就把「怎么切块」的计算结果缓存下来，
++        # 之后每一步都复用，省去重复计算。第一次进来时算一次并存起来。
+         precompute_grid_thw = getattr(self.config, "precompute_grid_thw", False)
+         if precompute_grid_thw and self.position_embeddings is None:
+             (
+@@ -242,12 +299,15 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+             for deepstack_embeds in deepstack_image_embeds
+         ]
+         image_embeds = torch.stack(image_chunks, dim=0)
++        # deepstack：VLM 的一个技巧——把浅层视觉特征也留一份，后面在文字大脑的前几层再「补一刀」，
++        # 让画面细节参与得更充分。这里只是把它们也按图切好、堆好，待用。
+         deepstack_image_embeds = [
+             torch.stack(chunks, dim=0)
+             for chunks in deepstack_chunks
+         ]
+         return image_embeds, deepstack_image_embeds
+ 
++    # embed_image / embed_language_tokens：分别是「把图片变数字」和「把文字变数字」的入口。
+     def embed_image(self, image: torch.Tensor, image_grid_thw: torch.LongTensor):
+         return self.get_image_features(
+             image,
+@@ -255,13 +315,17 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+         )
+ 
+     def embed_language_tokens(self, tokens: torch.Tensor):
++        # 把文字编号（token id）查表换成对应的一串数字。
+         return self.qwenvl.model.language_model.embed_tokens(tokens)
+ 
++    # 造一个「特殊标记」的数字表示，并复制成一整批同样的（比如句子的开始/结束符）。
+     def embed_special_token(self, token_id: int, batch: int, count: int, device, dtype):
+         token = torch.tensor([token_id], device=device, dtype=torch.long)
+         emb = self.embed_language_tokens(token).to(dtype=dtype)
+         return emb.view(1, 1, 1, -1).expand(batch, count, 1, -1)
+ 
++    # 计算「位置编号」：告诉模型每个信息块排在第几位（顺序/坐标）。
++    # 图片是二维的，所以位置不是简单的 1、2、3，而是带行列信息的多维编号（俗称 mRoPE）。
+     def build_prefix_position_ids(self, input_ids, attention_mask,
+                                    image_grid_thw=None, video_grid_thw=None):
+         position_ids, _ = self.qwenvl.model.get_rope_index(
+@@ -272,10 +336,13 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+         )
+         return position_ids
+ 
++    # 把上面算出的「位置编号」真正「盖」到信息上，让模型在做注意力时能感知先后顺序/坐标。
+     def apply_mrope(self, query_states, key_states, position_ids):
+         position_embeddings = self.qwenvl.model.language_model.rotary_emb(query_states, position_ids)
+         return apply_rotary_pos_emb(query_states, key_states, *position_embeddings, unsqueeze_dim=2)
+ 
++    # KV 缓存：推理时「图片+指令」这部分算过一次后就不变了，把它的中间结果存起来，
++    # 之后每一步去噪都直接复用，不用反复重算，大幅加速。（训练时用不到这个。）
+     def handle_kv_cache(
+         self,
+         key_states: torch.Tensor,
+@@ -295,6 +362,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+                 value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+         return key_states, value_states, past_key_values
+ 
++    # 前面留存的「浅层视觉特征」，在文字大脑的前几层追加进去，给画面细节再补充一遍。
+     def _apply_deepstack(self, hidden_states, layer_idx, visual_pos_masks, deepstack_visual_embeds):
+         if (
+             deepstack_visual_embeds is not None
+@@ -308,6 +376,18 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+             )
+         return hidden_states
+ 
++    # =========================================================================
++    # 【整个类的心脏】两个大脑「手拉手、一层一层」往前算。
++    #
++    # 直觉版流程（每一层都重复做一遍）：
++    #   a) 让「画面+文字」这边 和「状态+动作」这边，各自算出自己的 Q/K/V（注意力三件套）。
++    #   b) 把两边的 Q/K/V 拼到一起，做一次「大家互相看一眼」的注意力——
++    #      于是动作这边就能「看到」画面和指令，画面这边也能被参考。
++    #   c) 各自拿注意力结果，走完这一层剩下的计算，得到这一层的输出，传给下一层。
++    #
++    # inputs_embeds 是一个长度为 2 的列表：[前半段(画面+指令), 后半段(状态+动作)]。
++    # 某一半可能是 None（比如推理时先只算前半段并缓存起来）。
++    # =========================================================================
+     def forward(
+         self,
+         attention_mask: Optional[torch.Tensor] = None,
+@@ -317,28 +397,34 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+         inputs_embeds: List[torch.FloatTensor] = None,
+         use_cache: Optional[bool] = None,
+         fill_kv_cache: Optional[bool] = None,
+-        ada_cond: List[torch.FloatTensor] = None,
++        ada_cond: List[torch.FloatTensor] = None,          # flow matching 的「时间」信息，注入动作专家
+         visual_pos_masks: Optional[torch.Tensor] = None,
+         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+     ):
++        # models[0] = 文字/画面大脑；models[1] = 动作专家小脑。下面按下标 i 分别取用。
+         models = [self.qwenvl.model.language_model, self.qwen_expert.model]
+         num_layers = self.qwenvl.config.text_config.num_hidden_layers
+         action_num_layers = self.config.qwen_expert_config.num_hidden_layers
+-        router_logits_list = []
++        router_logits_list = []  # 收集每个 MoE 层「路由器怎么挑专家」的原始打分，训练时算负载均衡用
+ 
++        # 两个大脑层数必须相等，否则没法一层一层配对。
+         assert action_num_layers == num_layers, (
+             "Action expert and VLM must have the same number of layers "
+             f"(got action={action_num_layers}, vlm={num_layers})."
+         )
+ 
++        # ===== 逐层循环：这是「手拉手往前走」的主体 =====
+         for layer_idx in range(num_layers):
++            # --- 步骤 a：两边各自算出注意力三件套 Q/K/V ---
++            # 可以粗略理解为：Q=「我想找什么」，K=「我是什么」，V=「我携带的内容」。
+             query_states = []
+             key_states = []
+             value_states = []
+             for i, hidden_states in enumerate(inputs_embeds):
+                 if hidden_states is None:
+-                    continue
++                    continue  # 这一半没数据（如推理阶段只算前半段），跳过
+                 if i == 1:
++                    # i==1 是动作专家：多传一个 ada_cond，把「当前时间进度」注入进去。
+                     q, k, v = models[i].layers[layer_idx](
+                         hidden_states, compute_kqv=True, ada_cond=ada_cond
+                     )
+@@ -348,9 +434,11 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+                 key_states.append(k.float())
+                 value_states.append(v.float())
+ 
++            # --- 步骤 b：把两边的 Q/K/V 首尾拼接，让它们在同一场注意力里互相「看见」 ---
+             query_states = torch.cat(query_states, dim=1)
+             key_states = torch.cat(key_states, dim=1)
+             value_states = torch.cat(value_states, dim=1)
++            # 盖上位置编号，让注意力知道谁在前谁在后、谁在画面的哪个位置。
+             query_states, key_states = self.apply_mrope(query_states, key_states, position_ids)
+             key_states, value_states, past_key_values = self.handle_kv_cache(
+                 key_states,
+@@ -360,6 +448,8 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+                 use_cache=use_cache,
+                 fill_kv_cache=fill_kv_cache,
+             )
++            # 真正做一次注意力计算。attention_mask 规定「谁能看谁、谁不能看谁」。
++            # flex_cached：第 0 层先把这张「谁能看谁」的表(block mask)建好，之后每层复用，省时间。
+             if self.config.attention_implementation == "flex_cached":
+                 if layer_idx == 0:
+                     _full_len = query_states.shape[1]
+@@ -375,6 +465,8 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+             else:
+                 att_output = self.attention_interface(query_states, key_states, value_states, attention_mask)
+ 
++            # --- 步骤 c：把注意力结果按「前半段/后半段」切开，各自走完本层剩余计算 ---
++            # start/end 用来在拼接后的长序列里，切出属于每一半的那一段。
+             outputs_embeds = []
+             start = 0
+             for i, hidden_states in enumerate(inputs_embeds):
+@@ -383,6 +475,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+                     continue
+                 end = start + hidden_states.shape[1]
+                 if i == 1:
++                    # 动作专家这一半：如果这层是 MoE，还会顺带返回「路由器打分」，收集起来备用。
+                     out_emb, router_logits = models[i].layers[layer_idx](
+                         hidden_states,
+                         att_output,
+@@ -394,25 +487,31 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+                     if router_logits is not None:
+                         router_logits_list.append(router_logits)
+                 else:
++                    # 画面/文字这一半：走完本层后，若有 deepstack 浅层特征就在前几层补进去。
+                     out_emb = models[i].layers[layer_idx](
+                         hidden_states, att_output, start, end, output_atten=True
+                     )
+                     out_emb = self._apply_deepstack(out_emb, layer_idx, visual_pos_masks, deepstack_visual_embeds)
+                 outputs_embeds.append(out_emb)
+                 start = end
++            # 本层输出成为下一层的输入，如此逐层推进。
+             inputs_embeds = outputs_embeds
+ 
++        # ===== 所有层走完，做最后一次归一化（收尾整理），得到最终输出 =====
+         outputs_embeds = []
+         for i, hidden_states in enumerate(inputs_embeds):
+             if hidden_states is None:
+                 outputs_embeds.append(None)
+             elif self.config.final_norm_adanorm and i == 1:
++                # 动作专家的收尾归一化也吃「时间」信息
+                 out_emb, _ = models[i].norm(hidden_states, ada_cond)
+                 outputs_embeds.append(out_emb)
+             else:
+                 outputs_embeds.append(models[i].norm(hidden_states))
++        # 返回：两半的最终输出、KV 缓存、每个 MoE 层的路由打分。
+         return outputs_embeds, past_key_values, router_logits_list
+ 
++    # 根据配置选择注意力的具体实现方式（不同实现速度/显存不同，效果一致）。
+     def get_attention_interface(self):
+         if self.config.attention_implementation == "flex":
+             print("=====Using Flex Attn=====")
+@@ -426,10 +525,25 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
+         raise ValueError(f"Invalid attention implementation: {self.config.attention_implementation}")
+ 
+ 
++# =============================================================================
++# 【核心类之二】Flow Matching（流匹配）——本模型「怎么生成动作」的方法。
++#
++# 用一个比喻理解 flow matching：
++#   想象目标动作被打乱成了一团随机噪声（像一团乱麻）。
++#   · 训练时：我们把「乱麻」和「正确动作」按某个比例混起来，问模型
++#     「从这里指向正确动作的方向是哪边？」，让它学会预测这个方向（叫 velocity/速度）。
++#   · 推理时：从纯乱麻出发，反复问模型「往哪个方向挪一小步」，走十来步就理顺成正确动作。
++#
++# 这个类还负责「顺便学两个副本领」（distillation，蒸馏）：
++#   · 预测画面的深度（远近）——让模型更懂三维空间；
++#   · 预测未来的画面——让模型更懂「动作会带来什么变化」。
++#   这两个副本领只在训练时用来「加练」，让主模型更聪明；部署时并不需要它们的输出。
++# =============================================================================
+ class FlowMatchingV2(FlowMatchingV1):
+     def __init__(self, config, eval):
+         nn.Module.__init__(self)
+         self.config = config
++        # 先把上面那份「两个大脑拼一起」的规格表填好，再据此搭出真正的联合模型。
+         qwenvl_with_export_config = QwenvlWithExpertV2Config(
+             freeze_vision_encoder=self.config.freeze_vision_encoder,
+             train_expert_only=self.config.train_expert_only,
+@@ -465,24 +579,31 @@ class FlowMatchingV2(FlowMatchingV1):
+         ]:
+             if hasattr(config, name):
+                 setattr(qwenvl_with_export_config, name, getattr(config, name))
++        # 真正搭出「两个大脑拼一起」的联合模型。
+         self.qwenvl_with_expert = QwenvlWithExpertV2Model(qwenvl_with_export_config, eval)
+         self.config.proj_width = qwenvl_with_export_config.qwen_expert_config.hidden_size
+         self.config.initializer_range = getattr(qwenvl_with_export_config.qwen_expert_config, "initializer_range", None)
+ 
++        # 下面这几个是「翻译层」（Linear=线性变换），负责在「机器人数字」和「模型内部数字」之间换算：
++        #   state_proj      : 机器人当前状态(如 55 维关节值) → 模型内部宽度
++        #   action_in_proj  : 待处理的动作           → 模型内部宽度（喂进去）
++        #   action_out_proj : 模型内部结果            → 动作维度（吐出来，即预测的方向 velocity）
++        #   action_time_mlp*: 把「动作」和「当前时间进度」两条信息融合到一起
+         self.state_proj = nn.Linear(self.config.max_state_dim, self.config.proj_width)
+         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
+         self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
+         self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
+         self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+ 
++        # align_params：控制「加练副本领」（深度/未来画面）的一堆开关。为空就表示不加练。
+         self.config.align_params = getattr(self.config, "align_params", None) or {}
+         if self.config.align_params != {}:
+             self.steps = 0
+             self.use_depth_align = True
+-            self.init_depth_heads(self.config.align_params)
++            self.init_depth_heads(self.config.align_params)   # 装上「预测深度」的小组件
+             self.use_future_video = self.config.align_params.get("use_future_video", False)
+             if self.use_future_video:
+-                self.init_video_heads(self.config.align_params)
++                self.init_video_heads(self.config.align_params)  # 装上「预测未来画面」的小组件
+         else:
+             self.use_depth_align = False
+             self.use_future_video = False
+@@ -496,12 +617,23 @@ class FlowMatchingV2(FlowMatchingV1):
+ 
+         self.set_requires_grad()
+ 
++    # =========================================================================
++    # 组装「前半段」输入。前半段 = 图片 + 指令文字（+ 若干「加练用的查询 token」）。
++    #
++    # 产出一串排好队的数字，交给上面的联合模型去算。顺序大致是：
++    #   [图片token] [指令文字token] [深度查询] [未来画面查询] [未来深度查询] ...
++    # 那些「查询 token」是特意插进去的「提问位」：模型在这些位置输出的结果，
++    # 之后会被用来预测深度/未来画面（即「加练副本领」）。不开加练时就只有图片+文字。
++    #
++    # 同时返回几张「配套表」：哪些位置是有效的(pad_masks)、哪些位置是图像(visual masks)、
++    # 每个位置排第几(position_ids)——供后面的注意力和位置编码使用。
++    # =========================================================================
+     def embed_prefix(
+         self,
+         images,
+-        img_masks,
+-        lang_tokens,
+-        lang_masks,
++        img_masks,       # 标记每张图是否真实存在（有的样本摄像头少，用它来忽略空位）
++        lang_tokens,     # 指令文字转成的编号
++        lang_masks,      # 标记指令里哪些位置是真实文字（哪些是补齐的空白）
+         image_grid_thw=None,
+     ):
+         if image_grid_thw is None:
+@@ -523,12 +655,13 @@ class FlowMatchingV2(FlowMatchingV1):
+         else:
+             flat_grid_thw = image_grid_thw
+ 
++        # 把图片像素变成一串代表画面的数字（img_emb），以及浅层特征(deepstack)。
+         img_emb, deepstack_embs = self.qwenvl_with_expert.embed_image(
+             images,
+             flat_grid_thw,
+         )
+         embed_dtype = img_emb.dtype
+-        num_patch = img_emb.shape[1]
++        num_patch = img_emb.shape[1]  # 每张图被切成了多少小块
+         img_emb = einops.rearrange(img_emb, "(b n) l d -> b n l d", b=bsize, n=num_images)
+         deepstack_embs = [
+             einops.rearrange(x, "(b n) l d -> b n l d", b=bsize, n=num_images)
+@@ -540,6 +673,8 @@ class FlowMatchingV2(FlowMatchingV1):
+         cfg = self.qwenvl_with_expert.qwenvl.config
+         visual_token_id = cfg.image_token_id
+ 
++        # Qwen3-VL 习惯在每张图前后各加一个「图片开始/图片结束」标记，像给图片打上引号，
++        # 帮模型分清「这一段是图片」。下面就是在图片数字的两头拼上这两个标记。
+         if getattr(self.config, "qwen3vl_use_vision_boundaries", True):
+             start_emb = self.qwenvl_with_expert.embed_special_token(
+                 cfg.vision_start_token_id, bsize, num_images, device, embed_dtype
+@@ -577,9 +712,12 @@ class FlowMatchingV2(FlowMatchingV1):
+         visual_pos_masks = einops.rearrange(image_visual_masks, "b n l -> b (n l)")
+         fake_image_ids = einops.rearrange(fake_image_ids, "b n l -> b (n l)")
+ 
++        # 把指令文字也变成数字。
+         lang_emb = self.qwenvl_with_expert.embed_language_tokens(lang_tokens).to(dtype=embed_dtype)
+ 
++        # ===== 分支一：开启了「加练」，需要在序列里插入各种「查询 token」（提问位）=====
+         if self.use_depth_align and self.align_type == "query":
++            # 小工具：把一组可学习的查询参数整理成「每类若干个 token」的形状。
+             def _get_align_tokens(tokens):
+                 tk_weights = tokens.view(self.num_task_tokens, tokens.shape[0] // self.num_task_tokens, tokens.shape[1])
+                 tk_weights = tk_weights.mean(dim=1)
+@@ -609,11 +747,13 @@ class FlowMatchingV2(FlowMatchingV1):
+                     torch.cat([current_task, current_video_task], dim=-1)
+                 )
+             align_embs = current_task.repeat(img_emb.size(0), 1, 1).to(img_emb.device, img_emb.dtype)
++            # parts 就是「最终要拼起来的队伍」，先放进图片，后面按需追加各种 token。
+             parts = [img_emb]
+             masks = [image_pad_masks]
+             input_ids = [fake_image_ids]
+             visual_masks = [visual_pos_masks]
+ 
++            # 小工具：往队伍末尾追加一段 token，并同步维护它对应的三张「配套表」。
+             def _append(
+                 tokens,
+                 token_masks,
+@@ -651,6 +791,8 @@ class FlowMatchingV2(FlowMatchingV1):
+                     "share_future_depth_query=True requires depth.use_future_depth=True."
+                 )
+ 
++            # 按配置决定「这次要插入哪些段」，再一段段追加到队伍里。
++            # 可能的段：指令文字、当前深度查询、未来画面查询、未来深度查询等。
+             for segment_name in prefix_query_segments(
+                 use_depth_align=True,
+                 use_future_depth=self.use_future_depth,
+@@ -663,15 +805,15 @@ class FlowMatchingV2(FlowMatchingV1):
+                     False,
+                 ),
+             ):
+-                if segment_name == "language":
++                if segment_name == "language":       # 指令文字
+                     _append(
+                         lang_emb,
+                         lang_masks,
+                         lang_tokens.to(device),
+                     )
+-                elif segment_name == "current_depth":
++                elif segment_name == "current_depth":   # 「预测当前画面深度」的提问位
+                     _append(align_embs, align_pad_masks, fake_align_ids)
+-                elif segment_name == "future_video_cls":
++                elif segment_name == "future_video_cls":  # 「预测未来画面整体特征」的提问位
+                     future_video_cls_align_emb = self.future_video_cls_align_emb.weight.repeat(
+                         img_emb.size(0), 1, 1
+                     ).to(img_emb.device, img_emb.dtype)
+@@ -688,31 +830,37 @@ class FlowMatchingV2(FlowMatchingV1):
+                         device=device,
+                     )
+                     _append(future_video_cls_align_emb, cls_align_pad_masks, fake_cls_align_ids)
+-                elif segment_name == "future_video":
++                elif segment_name == "future_video":    # 「预测未来画面细节」的提问位
+                     future_video_align_embs = _get_align_tokens(self.future_video_align_embs).repeat(
+                         img_emb.size(0), 1, 1
+                     ).to(img_emb.device, img_emb.dtype)
+                     _append(future_video_align_embs, align_pad_masks, fake_align_ids)
+-                elif segment_name == "future_depth":
++                elif segment_name == "future_depth":    # 「预测未来画面深度」的提问位
+                     _append(future_align_embs, align_pad_masks, fake_align_ids)
+                 else:
+                     raise ValueError(f"Unsupported prefix query segment: {segment_name}")
+ 
++            # 把队伍里所有段首尾拼成一整条序列，配套表也一并拼好。
+             embs = torch.cat(parts, dim=1)
+             pad_masks = torch.cat(masks, dim=1)
+             prefix_input_ids = torch.cat(input_ids, dim=1)
+             full_visual_pos_masks = torch.cat(visual_masks, dim=1)
+         else:
++            # ===== 分支二：没开加练，前半段就只有「图片 + 指令文字」，简单拼一下 =====
+             embs = torch.cat([img_emb, lang_emb], dim=1)
+             pad_masks = torch.cat([image_pad_masks, lang_masks], dim=1)
+             prefix_input_ids = torch.cat([fake_image_ids, lang_tokens.to(device)], dim=1)
+             full_visual_pos_masks = torch.cat([visual_pos_masks, torch.zeros_like(lang_masks)], dim=1)
+ 
++        # att_masks 控制前半段内部的「看得见/看不见」规则：
++        #   vlm_causal=True  → 因果模式：每个位置只能看它前面的（像读句子从左往右）；
++        #   False            → 全看模式：前半段内部大家互相都能看见。
+         if getattr(self.config, "vlm_causal", False):
+             att_masks = torch.ones((bsize, embs.shape[1]), device=device, dtype=torch.bool)
+         else:
+             att_masks = torch.zeros((bsize, embs.shape[1]), device=device, dtype=torch.bool)
+ 
++        # 算好前半段每个位置的「排位/坐标」编号。
+         flat_img_masks = einops.rearrange(img_masks, "b n -> (b n)")
+         rope_grid_thw = flat_grid_thw[flat_img_masks]
+         if rope_grid_thw.numel() == 0:
+@@ -738,14 +886,17 @@ class FlowMatchingV2(FlowMatchingV1):
+         )
+         return result
+ 
++    # 把「前半段」和「后半段」的位置编号接成一整条：
++    # 后半段(状态+动作)的排位，从前半段最大编号往后接着数下去。
+     def _build_full_position_ids(self, prefix_position_ids, prefix_pad_masks, suffix_pad_masks):
+         valid_prefix_pos = prefix_position_ids.masked_fill(~prefix_pad_masks.unsqueeze(0), 0)
+-        prefix_offsets = valid_prefix_pos.amax(dim=(0, 2)) + 1
++        prefix_offsets = valid_prefix_pos.amax(dim=(0, 2)) + 1   # 前半段最大编号 + 1 = 后半段的起点
+         suffix_1d = prefix_offsets[:, None] + torch.cumsum(suffix_pad_masks.long(), dim=1) - 1
+         suffix_1d = suffix_1d.masked_fill(~suffix_pad_masks, 1)
+         suffix_position_ids = suffix_1d.unsqueeze(0).expand(3, -1, -1)
+         return torch.cat([prefix_position_ids, suffix_position_ids], dim=-1)
+ 
++    # 从算完的结果里，切出「当前深度提问位」那几个 token（供预测深度用）。
+     def _current_depth_task_tokens(self, hidden_states, num_images=3):
+         query_spans = prefix_query_token_spans(
+             prefix_len=hidden_states.shape[1],
+@@ -764,17 +915,29 @@ class FlowMatchingV2(FlowMatchingV1):
+         start, end = query_spans["current_depth"]
+         return hidden_states[:, start:end, :]
+ 
++    # =========================================================================
++    # 【训练时走这里】跑一遍前向，算出各种 loss（误差），供反向传播更新模型。
++    #
++    # flow matching 训练的核心三行（下面代码里就是）：
++    #   1) 造一团随机噪声 noise；
++    #   2) 按「时间比例 time」把噪声和真实动作 actions 混成一个中间点 x_t；
++    #   3) 让模型看着 x_t 去预测「从噪声指向真实动作的方向」u_t = noise - actions。
++    #   模型预测得越准，loss 越小。
++    #
++    # depth_targets / future_* 这些是「加练副本领」的标准答案（由外部老师模型提前算好），
++    # 只在训练时传进来，用于额外的深度/未来画面 loss。
++    # =========================================================================
+     def forward(
+         self,
+         images,
+         img_masks,
+         lang_tokens,
+         lang_masks,
+-        state,
+-        actions,
+-        noise=None,
+-        time=None,
+-        loss_type="fm",
++        state,           # 机器人当前状态
++        actions,         # 这一段的真实动作（训练的标准答案）
++        noise=None,      # 随机噪声；不给就现场随机生成
++        time=None,       # 混合比例（0~1）；不给就随机采样
++        loss_type="fm",  # 误差算法：fm=平方误差，L1_fm=绝对值误差
+         depth_targets=None,
+         image_grid_thw=None,
+         future_depth_targets=None,
+@@ -785,13 +948,13 @@ class FlowMatchingV2(FlowMatchingV1):
+         dtype = state.dtype
+         device = state.device
+         if noise is None:
+-            noise = torch.randn(actions.shape, device=device, dtype=dtype)
++            noise = torch.randn(actions.shape, device=device, dtype=dtype)  # ① 造随机噪声
+         if time is None:
+-            time = self.sample_time(actions.size(0), device).to(dtype)
++            time = self.sample_time(actions.size(0), device).to(dtype)      # 随机挑一个混合比例
+ 
+         time_expanded = time[:, None, None]
+-        x_t = time_expanded * noise + (1 - time_expanded) * actions
+-        u_t = noise - actions
++        x_t = time_expanded * noise + (1 - time_expanded) * actions         # ② 噪声与真实动作的混合中间点
++        u_t = noise - actions                                               # ③ 「正确方向」——模型要去逼近它
+ 
+         (
+             prefix_embs,
+@@ -800,21 +963,26 @@ class FlowMatchingV2(FlowMatchingV1):
+             prefix_position_ids,
+             visual_pos_masks,
+             deepstack_visual_embeds,
+-        ) = self.embed_prefix(
++        ) = self.embed_prefix(          # 组装前半段：图片 + 指令(+ 加练提问位)
+             images,
+             img_masks,
+             lang_tokens,
+             lang_masks,
+             image_grid_thw=image_grid_thw,
+         )
++        # 组装后半段：机器人状态 + 上面的混合中间点 x_t（并把「时间」也编码出来）。
+         time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+             state, x_t, time
+         )
+ 
++        # 把前后两段的「有效位表」和「看得见规则」拼起来，做成一张二维的注意力允许表
++        # （att_2d_masks[i][j] 表示第 i 个位置能不能看第 j 个位置）。
+         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+         prefix_len = prefix_pad_masks.shape[1]
++        # 下面两处 block_* 是「切断某些信息流」的开关：比如不让「未来深度/未来画面」的信息
++        # 泄漏给动作分支（防止模型作弊：靠偷看未来来输出动作，而不是真学会决策）。
+         if self.block_future_depth_to_action:
+             att_2d_masks = block_suffix_to_fv_(
+                 att_2d_masks,
+@@ -830,6 +998,8 @@ class FlowMatchingV2(FlowMatchingV1):
+         )
+         position_ids = self._build_full_position_ids(prefix_position_ids, prefix_pad_masks, suffix_pad_masks)
+ 
++        # ===== 核心计算：把前后两段一起喂进「两个大脑联合模型」，逐层算出结果 =====
++        # outputs_embeds = 前半段的输出（供加练用）；suffix_out = 后半段的输出（供出动作）。
+         (outputs_embeds, suffix_out), _, router_logits_list = self.qwenvl_with_expert.forward(
+             attention_mask=att_2d_masks,
+             position_ids=position_ids,
+@@ -842,14 +1012,20 @@ class FlowMatchingV2(FlowMatchingV1):
+             visual_pos_masks=visual_pos_masks,
+             deepstack_visual_embeds=deepstack_visual_embeds,
+         )
++        # ===== 加练副本领的 loss（只在开启加练时计算）=====
++        # 思路：拿前半段里那些「提问位」的输出，去预测深度图/未来画面，
++        # 再和外部老师模型给的标准答案比一比，差多少就是对应的 loss。
++        # 每个 loss 都乘一个很小的权重(如 0.004)，表示「加练只是辅助，别抢了主任务的风头」。
+         align_metrics = {}
+         if self.config.align_params != {}:
++            # 预测「当前画面深度」和「未来画面深度」，得到两个 loss。
+             loss_depth, loss_future_depth, depth_preds, future_depth_preds = self.depth_emb_forward(outputs_embeds, depth_targets, img_masks,future_depth_targets,)
+             loss_depth = loss_depth * self.config.align_params["depth_loss_weight"]
+             loss_future_depth = loss_future_depth * self.config.align_params.get("future_depth_loss_weight", 1.0)
+             loss_future_video = 0
+             future_video_preds = None
+             current_video_preds = None
++            # 预测「未来画面」，得到未来画面 loss。
+             if getattr(self, "use_future_video", False):
+                 loss_video, future_video_preds, video_metrics = self.video_emb_forward(
+                     outputs_embeds,
+@@ -897,26 +1073,40 @@ class FlowMatchingV2(FlowMatchingV1):
+             future_video_preds = None
+             current_video_preds = None
+ 
++        # ===== 主任务：把后半段输出翻译成「模型预测的方向」v_t =====
++        # 只取最后 n_action_steps 个位置（那些才是真正对应动作的输出）。
+         suffix_out = suffix_out[:, -self.config.n_action_steps :]
+         if getattr(self.config, "action_fp32", False):
+-            v_t = self._fp32_linear(self.action_out_proj, suffix_out)
++            v_t = self._fp32_linear(self.action_out_proj, suffix_out)   # 用高精度算，动作更稳
+         else:
+             if suffix_out.dtype != self.action_out_proj.weight.dtype:
+                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
+             v_t = self.action_out_proj(suffix_out)
+ 
++        # 主 loss：模型预测方向 v_t 与「正确方向」u_t 差多少。fm=平方误差，L1_fm=绝对值误差。
+         if loss_type == "fm":
+             losses = F.mse_loss(u_t, v_t, reduction="none")
+         elif loss_type == "L1_fm":
+             losses = F.l1_loss(u_t, v_t, reduction="none")
+ 
++        # MoE 的额外 loss：让「一群专家」的活儿分得均匀些，别老是集中到少数几个专家上。
+         seq_wise_loss, router_z_loss, moe_metrics = self._moe_losses_and_metrics(
+             router_logits_list, losses
+         )
+         if align_metrics:
+             moe_metrics.update(align_metrics)
++        # 把主 loss、各种加练 loss、MoE loss 及一堆监控指标一起返回给上层去汇总。
+         return losses, loss_depth, loss_future_depth, loss_future_video, depth_preds, seq_wise_loss, router_z_loss, moe_metrics, future_depth_preds, future_video_preds, current_video_preds
+ 
++    # =========================================================================
++    # 【推理/部署时走这里】真正让机器人「出动作」的地方。
++    #
++    # 做法（对应下面代码）：
++    #   1) 先把「图片+指令」这前半段算一遍，结果存进 KV 缓存（这部分整个过程不变，只算一次）；
++    #   2) 从一团纯噪声出发，反复调用 predict_velocity 问「往哪个方向挪一小步」，
++    #      每问一次就挪一步，走 num_steps 步（通常约 10 步）后，噪声就被理顺成了最终动作。
++    # 训练时没有这个循环——训练只需一次前向去算 loss；这里才是「一步步生成」。
++    # =========================================================================
+     def sample_actions(
+         self,
+         images,
+@@ -933,12 +1123,15 @@ class FlowMatchingV2(FlowMatchingV1):
+         dtype = state.dtype
+ 
+         if noise is None:
++            # 起点：一团纯随机噪声，形状 = (批大小, 动作步数, 动作维度)。
+             actions_shape = (
+                 bsize,
+                 self.config.n_action_steps,
+                 self.config.max_action_dim,
+             )
+-            noise = torch.randn(actions_shape, device=device, dtype=dtype)
++            # Routed through introspect so a caller can pin the draw; falls back
++            # to torch.randn when nothing is pinned.
++            noise = introspect.make_noise(actions_shape, device, dtype)
+ 
+         (
+             prefix_embs,
+@@ -956,21 +1149,52 @@ class FlowMatchingV2(FlowMatchingV1):
+         )
+         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+ 
+-        _, past_key_values, _ = self.qwenvl_with_expert.forward(
++        introspect.record_noise(noise)
++
++        # 第 1 步：只算前半段(图片+指令)，把中间结果存进 past_key_values(KV 缓存)。
++        # inputs_embeds=[prefix_embs, None] 里第二项是 None，表示这次不算后半段。
++        prefix_out, past_key_values, _ = self.qwenvl_with_expert.forward(
+             attention_mask=prefix_att_2d_masks,
+             position_ids=prefix_position_ids,
+             vlm_position_ids=prefix_position_ids,
+             past_key_values=None,
+             inputs_embeds=[prefix_embs, None],
+             use_cache=self.config.use_cache,
+-            fill_kv_cache=True,
++            fill_kv_cache=True,                 # True = 把算好的结果写进缓存
+             visual_pos_masks=visual_pos_masks,
+             deepstack_visual_embeds=deepstack_visual_embeds,
+         )
+ 
++        if introspect.enabled():
++            # The 8 distillation query positions are the model's own readout of
++            # scene geometry and dynamics, so they are the observable proxy for
++            # the perception component. They are computed on every inference pass
++            # already; nothing here changes the actions produced.
++            qslice = None
++            if getattr(self, "use_depth_align", False) and getattr(self, "align_type", None) == "query":
++                spans = prefix_query_token_spans(
++                    prefix_len=prefix_embs.shape[1],
++                    num_task_tokens=self.num_task_tokens,
++                    use_depth_align=True,
++                    use_future_depth=getattr(self, "use_future_depth", False),
++                    use_future_video=getattr(self, "use_future_video", False),
++                    use_future_video_cls=getattr(self, "use_future_video_cls", False),
++                    use_future_video_patch=getattr(self, "use_future_video_patch", True),
++                    future_video_share_future_depth_query=getattr(
++                        self, "future_video_share_future_depth_query", False
++                    ),
++                )
++                qslice = spans.get("current_depth")
++            introspect.record_prefix(
++                prefix_out[0] if isinstance(prefix_out, (list, tuple)) else prefix_out,
++                visual_pos_masks,
++                qslice,
++            )
++
++        # 第 2 步：准备去噪循环。dt 是每步「时间」的步长（负数，因为从 1 走向 0）。
+         dt = torch.tensor(-1.0 / self.config.num_steps, dtype=dtype, device=device)
+-        x_t = noise
+-        time = torch.tensor(1.0, dtype=dtype, device=device)
++        x_t = noise                                           # 当前状态从纯噪声开始
++        time = torch.tensor(1.0, dtype=dtype, device=device)  # 时间从 1（纯噪声）走到 0（成品）
+         count = 0
+         predict_velocity_fn = self.predict_velocity
+         if getattr(self, "_use_compile_predict_velocity", False):
+@@ -984,9 +1208,11 @@ class FlowMatchingV2(FlowMatchingV1):
+                 )
+                 self._compiled_predict_velocity = predict_velocity_fn
+ 
++        # 第 3 步：去噪循环。每一圈问一次「往哪挪」，然后挪一小步，直到 time 走到 0。
+         while time >= -dt / 2:
+             count += 1
+             expanded_time = time.expand(bsize)
++            # 复用第 1 步的 KV 缓存，只算后半段，得到「当前该往哪个方向走」v_t。
+             v_t = predict_velocity_fn(
+                 state,
+                 prefix_pad_masks,
+@@ -996,24 +1222,32 @@ class FlowMatchingV2(FlowMatchingV1):
+                 prefix_position_ids=prefix_position_ids,
+             )
+ 
+-            x_t += dt * v_t
+-            time += dt
++            introspect.record_denoise_step(x_t, v_t)
++
++            x_t += dt * v_t   # 朝这个方向挪一小步
++            time += dt        # 时间前进一步（越来越接近成品）
+         print(f"Denoise {count} steps")
+-        return x_t
++        return x_t            # 循环结束，x_t 就是最终动作
+ 
++    # =========================================================================
++    # 去噪循环里每一步调用的「单步预测」：给定当前中间状态 x_t 和时间，问「往哪个方向挪」。
++    # 关键点：前半段(图片+指令)已经算好放在 past_key_values 缓存里了，这里只需算后半段，
++    # 所以比训练时那次完整前向快得多——这也是推理能做到约 130ms 的原因之一。
++    # =========================================================================
+     def predict_velocity(
+         self,
+         state,
+         prefix_pad_masks,
+-        past_key_values,
+-        x_t,
+-        timestep,
++        past_key_values,      # 前半段的 KV 缓存，直接复用
++        x_t,                  # 当前的中间状态（噪声正在被一步步理顺）
++        timestep,             # 当前时间进度
+         prefix_position_ids=None,
+     ):
+         """Predict velocity at time t using cached Qwen3-VL prefix states."""
+         if prefix_position_ids is None:
+             raise ValueError("FlowMatchingV2.predict_velocity requires Qwen3-VL prefix_position_ids.")
+ 
++        # 把「机器人状态 + 当前中间状态 x_t + 时间」组装成后半段输入。
+         time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+             state,
+             x_t,
+@@ -1028,6 +1262,7 @@ class FlowMatchingV2(FlowMatchingV1):
+             suffix_len,
+             prefix_len,
+         )
++        # 拼出「后半段能看前半段(缓存) + 后半段内部」的注意力允许表。
+         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+         if self.block_future_depth_to_action:
+@@ -1051,15 +1286,23 @@ class FlowMatchingV2(FlowMatchingV1):
+         )
+         position_ids = full_position_ids[:, :, -suffix_len:]
+ 
+-        outputs_embeds, _, _ = self.qwenvl_with_expert.forward(
++        # 只算后半段（inputs_embeds 第一项是 None），并读用而非写入缓存(fill_kv_cache=False)。
++        # The third return is the per-layer MoE router logits. Inference used to
++        # drop them; they are the observable for the routing component.
++        outputs_embeds, _, router_logits_list = self.qwenvl_with_expert.forward(
+             attention_mask=full_att_2d_masks,
+             position_ids=position_ids,
+             past_key_values=past_key_values,
+             inputs_embeds=[None, suffix_embs],
+             use_cache=self.config.use_cache,
+-            fill_kv_cache=False,
++            fill_kv_cache=False,                # False = 只读缓存，不改它
+             ada_cond=time_embs if getattr(self.config, "adanorm_time", False) else None,
+         )
++        introspect.record_router(
++            router_logits_list, top_k=getattr(self.config, "token_top_k", 4)
++        )
++
++        # 取后半段结果里对应动作的部分，翻译成「该往哪个方向走」v_t 返回。
+         suffix_out = outputs_embeds[1]
+         suffix_out = suffix_out[:, -self.config.n_action_steps :]
+         if getattr(self.config, "action_fp32", False):
+@@ -1070,7 +1313,19 @@ class FlowMatchingV2(FlowMatchingV1):
+             v_t = self.action_out_proj(suffix_out)
+         return v_t
+ 
++    # =========================================================================
++    # 计算 MoE 的两类「辅助 loss」，外加一堆「体检指标」。
++    #
++    # 为什么需要它：MoE 靠一个「路由器」给每个 token 挑专家。如果放任不管，路由器容易
++    # 偷懒——总把活派给少数几个专家，其他专家闲置（甚至「饿死」）。这两类 loss 就是
++    # 「惩罚分工不均」，逼着路由器把活儿摊平：
++    #   · router_z_loss   : 防止路由打分数值过大而失稳；
++    #   · seq_wise_loss   : 鼓励在每个样本内部，各专家被用得差不多均匀。
++    # 后面一大段 with torch.no_grad() 只是在「量体温」——统计各专家的负载、有没有饿死的，
++    # 这些数字只写进监控面板(TensorBoard)看，不影响训练本身。
++    # =========================================================================
+     def _moe_losses_and_metrics(self, router_logits_list, losses):
++        # ---- 辅助 loss 一：router z-loss，防止路由打分数值爆炸 ----
+         router_z_loss_coeff = getattr(self.config, "router_z_loss_coeff", 0)
+         router_z_loss = losses.new_zeros(())
+         router_z_layer_losses = None  # per-layer raw z-loss (pre-coeff), for monitoring
+@@ -1081,6 +1336,7 @@ class FlowMatchingV2(FlowMatchingV1):
+             ]
+             router_z_loss = router_z_loss_coeff * torch.stack(router_z_layer_losses).mean()
+ 
++        # ---- 辅助 loss 二：sequence-wise 均衡 loss，鼓励每个样本内部各专家用得均匀 ----
+         seq_wise_loss_coeff = getattr(self.config, "sequence_wise_loss_coeff", 0)
+         seq_wise_loss = 0
+         seqwise_layer_losses = None  # per-layer raw seq-wise balance loss (pre-coeff), for monitoring
+@@ -1106,6 +1362,7 @@ class FlowMatchingV2(FlowMatchingV1):
+             if seqwise_layer_losses:
+                 seq_wise_loss = seq_wise_loss_coeff * torch.stack(seqwise_layer_losses).mean()
+ 
++        # ---- 下面全是「体检指标」：统计每一层各专家分到多少活、有没有饿死的，只用于监控 ----
+         moe_metrics = {}
+         if router_logits_list:
+             token_moe_layers_list = sorted(getattr(self.config, "token_moe_layers", None) or [])
+@@ -1132,11 +1389,12 @@ class FlowMatchingV2(FlowMatchingV1):
+                     else:
+                         _, selected = torch.topk(routing_probs, 1, dim=-1)
+                         counts = F.one_hot(selected.squeeze(-1), num_classes=num_experts).float().sum(dim=0)
+-                    avg_load = counts.mean()
++                    # counts = 这一层每个专家分到了多少 token。理想情况是大家差不多。
++                    avg_load = counts.mean()                            # 平均每个专家分到多少
+                     denom = avg_load.clamp(min=1e-9)
+-                    maxvio = (counts.max() - avg_load) / denom          # peak overload  (>=0, larger=worse)
+-                    minvio = (avg_load - counts.min()) / denom          # valley underload (=1 -> dead expert)
+-                    min_load_ratio = counts.min() / denom               # =0 -> dead expert
++                    maxvio = (counts.max() - avg_load) / denom          # 最忙的专家比平均超出多少（越大越不均）
++                    minvio = (avg_load - counts.min()) / denom          # 最闲的专家比平均少多少（=1 表示有专家饿死）
++                    min_load_ratio = counts.min() / denom               # 最闲专家/平均（=0 表示饿死）
+                     # entropy is rank-local (this rank's routing_probs, last micro-batch).
+                     per_sample_entropy = -(routing_probs * routing_probs.clamp(min=1e-9).log()).sum(dim=-1)
+                     entropy = per_sample_entropy.mean()
+@@ -1195,12 +1453,19 @@ class FlowMatchingV2(FlowMatchingV1):
+         return seq_wise_loss, router_z_loss, moe_metrics
+ 
+ 
++# =============================================================================
++# 【核心类之三 / 最外层】对外的「策略模型」。训练脚本、评测、部署代码拿到的就是它。
++# 它自己不做复杂计算，只是把上面的 FlowMatchingV2 包起来，并对接训练框架需要的接口
++# （分布式切分方案、权重加载器、forward 汇总 loss、sample_actions 出动作）。
++# =============================================================================
+ class LingbotVlaV2Policy(PreTrainedModel):
+     config_class = LingbotVLAV2Config
+     name = "torch_lingbot_vla_v2"
+     supports_gradient_checkpointing = True
++    # 告诉分布式框架：这几种模块是「不可再切分的最小单元」，切分显存时要整块处理。
+     _no_split_modules = ["Qwen2DecoderLayer", "FixQwen2RMSNorm", "FixAdaRMSNorm"]
+ 
++    # 多卡训练时，如何把「一群专家」分摊到不同 GPU 上（专家并行 EP 的切分方案）。
+     def get_parallel_plan(self):
+         from lingbotvla.distributed.parallel_plan import ParallelPlan
+         from torch.distributed._tensor import Shard
+@@ -1212,6 +1477,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
+         }
+         return ParallelPlan(ep_plan=ep_plan)
+ 
++    # 加载预训练权重时用的专用加载器（负责把磁盘上的权重对应到模型各部件）。
+     @classmethod
+     def get_weight_loader(cls):
+         return LingBotVLAWeightLoader()
+@@ -1220,7 +1486,8 @@ class LingbotVlaV2Policy(PreTrainedModel):
+         super().__init__(config)
+         self.config = config
+         self.language_tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
+-        self.model = FlowMatchingV2(config, eval)
++        self.model = FlowMatchingV2(config, eval)   # 真正干活的在这里面
++        # 这个模型只出动作、不生成文字，所以「预测下一个字」的输出头(lm_head)删掉省显存。
+         if not getattr(self.config, "use_lm_head", False):
+             del self.model.qwenvl_with_expert.qwenvl.lm_head
+         del self.model.qwenvl_with_expert.qwen_expert.lm_head
+@@ -1233,6 +1500,11 @@ class LingbotVlaV2Policy(PreTrainedModel):
+     def get_optim_params(self) -> dict:
+         return self.parameters()
+ 
++    # =========================================================================
++    # 训练框架每一步调用的入口。它做两件事：
++    #   1) 调用里层 FlowMatchingV2.forward，拿到主 loss + 各种加练/MoE loss；
++    #   2) 把这些 loss 按合适的方式求平均、加权求和成一个总 loss，返回给训练循环去反向传播。
++    # =========================================================================
+     def forward(
+         self,
+         images,
+@@ -1241,7 +1513,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
+         lang_tokens,
+         lang_masks,
+         actions,
+-        joint_mask=None,
++        joint_mask=None,        # 标记动作里哪些「关节维度」是这台机器人真实用到的（其余是补齐的，忽略）
+         action_is_pad=None,
+         noise=None,
+         time=None,
+@@ -1287,21 +1559,26 @@ class LingbotVlaV2Policy(PreTrainedModel):
+             future_video_current_patch=future_video_current_patch,
+         )
+ 
++        # 动作被统一成 55 维，但每台机器人只用到其中一部分维度。
++        # joint_mask 就是「哪些维度算数」的表：只在真实用到的维度上算误差，补齐的维度不参与。
+         if joint_mask is not None:
+             if "repeat" in self.config.loss_type:
+                 joint_mask = joint_mask.repeat(2, 1, 1)
+             assert len(joint_mask.shape) == 3
+-            
+-            masked_losses = losses * joint_mask
+-            valid_counts = joint_mask.sum(dim=(1, 2)).clamp(min=1)
+-            batch_mean_losses = masked_losses.sum(dim=(1, 2)) / valid_counts
+-            loss_vla = masked_losses.sum() / joint_mask.sum().clamp(min=1)
++
++            masked_losses = losses * joint_mask                              # 屏蔽掉无效维度
++            valid_counts = joint_mask.sum(dim=(1, 2)).clamp(min=1)           # 每个样本有效维度个数
++            batch_mean_losses = masked_losses.sum(dim=(1, 2)) / valid_counts # 每个样本的平均误差
++            loss_vla = masked_losses.sum() / joint_mask.sum().clamp(min=1)   # 整批的平均误差（主 loss）
+         else:
++            # 没给 mask 就退化为「只取前 action_dim 个维度」直接求平均。
+             losses = losses[:, :, : self.config.action_dim]
+             batch_mean_losses = losses.mean(dim=(1, 2))
+             loss_vla = losses.mean()
+ 
+         loss_dict["batch_mean_losses"] = batch_mean_losses.detach()
++        # 总 loss = 主任务(出动作) + 加练三项(深度/未来深度/未来画面) + MoE 两项均衡。
++        # 反向传播时，这一个数会同时把所有本领的梯度都带上，一起更新模型。
+         total_loss = (
+             loss_vla
+             + loss_depth
+@@ -1315,6 +1592,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
+             loss_dict.update(moe_metrics)
+         return total_loss, loss_vla, loss_depth, loss_future_depth, loss_future_video, seq_wise_loss, loss_dict, depth_preds, future_depth_preds, future_video_preds, current_video_preds
+ 
++    # 部署/评测出动作的入口，直接转交给里层 FlowMatchingV2 的去噪循环。
+     def sample_actions(self, *args, **kwargs) -> Tensor:
+         return self.model.sample_actions(*args, **kwargs)
+ 
