@@ -25,7 +25,10 @@ from contextlib import contextmanager
 
 import torch
 
-_STATE = {"enabled": False, "buf": None, "noise_seed": None}
+_STATE = {"enabled": False, "buf": None, "noise_seed": None, "sampler": "euler",
+          "step_gen": None}
+
+SAMPLERS = ("euler", "vine")
 
 
 def enabled() -> bool:
@@ -43,6 +46,21 @@ def set_noise_seed(seed):
     episode takes, which is exactly what varying exec_horizon does.
     """
     _STATE["noise_seed"] = seed
+    # The per-step noise stream restarts with the decision, so replaying the
+    # same (seed, sampler) is bit-reproducible even within one server process.
+    _STATE["step_gen"] = None
+
+
+def set_sampler(name):
+    """Select the denoising sampler for the next decision: euler (default) or vine."""
+    name = name or "euler"
+    if name not in SAMPLERS:
+        raise ValueError(f"unknown sampler {name!r}, expected one of {SAMPLERS}")
+    _STATE["sampler"] = name
+
+
+def sampler() -> str:
+    return _STATE["sampler"]
 
 
 def make_noise(shape, device, dtype):
@@ -53,11 +71,32 @@ def make_noise(shape, device, dtype):
     return torch.randn(shape, generator=g, device=device, dtype=dtype)
 
 
+def make_step_noise(shape, device, dtype):
+    """Fresh per-step noise for the VINE sampler (arXiv 2607.10369).
+
+    VINE draws a new z_k at every denoising step. Under a pinned decision seed
+    the stream must be (a) reproducible across replays and (b) distinct from the
+    initial draw of make_noise. A single generator seeded by a splitmix-style
+    scramble of the decision seed gives both: sequential draws differ per step,
+    and set_noise_seed resets the stream at each decision boundary.
+    """
+    if _STATE["noise_seed"] is None:
+        return torch.randn(shape, device=device, dtype=dtype)
+    g = _STATE["step_gen"]
+    if g is None:
+        g = torch.Generator(device=device)
+        g.manual_seed((int(_STATE["noise_seed"]) * 6364136223846793005
+                       + 1442695040888963407) % (2 ** 63))
+        _STATE["step_gen"] = g
+    return torch.randn(shape, generator=g, device=device, dtype=dtype)
+
+
 @contextmanager
 def capture():
     """Enable capture for one decision and yield the dict it fills."""
     prev_enabled, prev_buf = _STATE["enabled"], _STATE["buf"]
-    buf = {"router_counts": [], "router_entropy": [], "denoise_x": [], "denoise_v_norm": []}
+    buf = {"router_counts": [], "router_entropy": [], "denoise_x": [],
+           "denoise_v_norm": [], "sel_pending": []}
     _STATE["enabled"], _STATE["buf"] = True, buf
     try:
         yield buf
@@ -108,6 +147,20 @@ def record_prefix(hidden_states, visual_pos_masks, query_slice):
         b["h_lang"] = h[lang].mean(0).detach().to(torch.float16)
 
 
+def record_layer_selection(selected_experts, num_experts):
+    """True per-layer selection counts, called from inside the MoE block.
+
+    The logits alone cannot reproduce the selection whenever a routing bias is
+    active: the block picks top-k of scores *plus* e_score_correction_bias, so a
+    counts summary recomputed from logits is blind to exactly the interventions
+    this instrumentation exists to observe.
+    """
+    if not _STATE["enabled"]:
+        return
+    _buf()["sel_pending"].append(
+        torch.bincount(selected_experts.reshape(-1), minlength=num_experts))
+
+
 def record_router(router_logits_list, top_k=4):
     """Summarize one denoising step's MoE routing.
 
@@ -123,16 +176,21 @@ def record_router(router_logits_list, top_k=4):
     # that Python/launch overhead — not the arithmetic — dominated the capture.
     lg = torch.stack([x.detach() for x in router_logits_list]).float()  # (L, T, E)
     n_layers, n_tokens, n_exp = lg.shape
-    k = min(top_k, n_exp)
-
-    idx = lg.topk(k, dim=-1).indices.reshape(n_layers, -1)              # (L, T*k)
-    counts = torch.zeros(n_layers, n_exp, device=lg.device, dtype=lg.dtype)
-    counts.scatter_add_(1, idx, torch.ones_like(idx, dtype=lg.dtype))
+    b = _buf()
+    pend = b.pop("sel_pending", [])
+    b["sel_pending"] = []
+    if len(pend) == n_layers:
+        # the block reported its actual (bias-inclusive) choices
+        counts = torch.stack(pend).to(lg.dtype)
+    else:
+        k = min(top_k, n_exp)
+        idx = lg.topk(k, dim=-1).indices.reshape(n_layers, -1)          # (L, T*k)
+        counts = torch.zeros(n_layers, n_exp, device=lg.device, dtype=lg.dtype)
+        counts.scatter_add_(1, idx, torch.ones_like(idx, dtype=lg.dtype))
 
     logp = torch.log_softmax(lg, dim=-1)
     ent = -(logp.exp() * logp).sum(-1).mean(-1)                          # (L,)
 
-    b = _buf()
     b["router_counts"].append(counts.to(torch.int16))
     b["router_entropy"].append(ent.to(torch.float16))
 

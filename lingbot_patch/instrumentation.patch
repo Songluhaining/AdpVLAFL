@@ -1,5 +1,5 @@
 diff --git a/deploy/lingbot_vla_v2_policy.py b/deploy/lingbot_vla_v2_policy.py
-index 96b9acb..bde55a6 100644
+index 96b9acb..b1cbbf3 100644
 --- a/deploy/lingbot_vla_v2_policy.py
 +++ b/deploy/lingbot_vla_v2_policy.py
 @@ -28,6 +28,7 @@ import torch.nn.functional as F
@@ -42,8 +42,7 @@ index 96b9acb..bde55a6 100644
 -        all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
 -        merged_weights = {}
 +        """Load the sharded checkpoint one shard at a time.
- 
--        for file_path in tqdm(all_safetensors):
++
 +        The checkpoint is stored in fp32 (~25GB for the 6B model). Merging every
 +        shard into a single dict before calling ``load_state_dict`` needs that
 +        25GB *on top of* the freshly built model, which does not fit on a 32GB
@@ -57,7 +56,8 @@ index 96b9acb..bde55a6 100644
 +        own_state = self.vla.state_dict()
 +        missing = set(own_state.keys())
 +        unexpected = []
-+
+ 
+-        for file_path in tqdm(all_safetensors):
 +        for file_path in tqdm(all_safetensors, desc="loading shards"):
 +            shard = {}
              with safe_open(file_path, framework="pt", device="cpu") as f:
@@ -103,7 +103,41 @@ index 96b9acb..bde55a6 100644
  
          self.load_model_weights(path_to_pi_model, strict=True)
          
-@@ -467,6 +518,34 @@ class LingbotVLAv2Server:
+@@ -336,6 +387,33 @@ class LingbotVLAv2Server:
+ 
+         return self.vla
+ 
++    def _apply_routing_bias(self, bias) -> None:
++        """Add a per-layer bias to the MoE router scores, or restore the originals.
++
++        The checkpoint's own e_score_correction_bias is snapshotted on first use
++        and the supplied bias is added on top of it, never overwriting it, so
++        clearing always returns the model to exactly its loaded state.
++        """
++        layers = self.vla.model.qwenvl_with_expert.qwen_expert.model.layers
++        if not hasattr(self, "_orig_router_bias"):
++            self._orig_router_bias = [
++                l.mlp.e_score_correction_bias.detach().clone() for l in layers
++            ]
++            self._router_bias_active = False
++        if bias is None:
++            if self._router_bias_active:
++                for l, o in zip(layers, self._orig_router_bias):
++                    l.mlp.e_score_correction_bias.copy_(o)
++                self._router_bias_active = False
++            return
++        b = torch.as_tensor(np.asarray(bias), dtype=torch.float32)
++        if b.shape != (len(layers), self._orig_router_bias[0].shape[0]):
++            raise ValueError(f"routing_bias shape {tuple(b.shape)} != "
++                             f"({len(layers)}, {self._orig_router_bias[0].shape[0]})")
++        for i, (l, o) in enumerate(zip(layers, self._orig_router_bias)):
++            l.mlp.e_score_correction_bias.copy_(o + b[i].to(o.device, o.dtype))
++        self._router_bias_active = True
++
+     def reset(self, robo_name, path_to_pi_model = None) -> None:
+         if path_to_pi_model is not None:
+             self.vla = self.load_vla(path_to_pi_model)
+@@ -467,6 +545,54 @@ class LingbotVLAv2Server:
              self.reset(robo_name=observation['robo_name'], path_to_pi_model=observation['path_to_pi_model'] if 'path_to_pi_model' in observation else None)
              return dict(action = None)
  
@@ -129,6 +163,26 @@ index 96b9acb..bde55a6 100644
 +            observation = dict(observation)
 +            noise_seed = observation.pop('noise_seed')
 +        lingbot_introspect.set_noise_seed(noise_seed)
++
++        # Denoising sampler selection: "euler" (default) or "vine" (per-step
++        # noise re-injection + endpoint prediction, arXiv 2607.10369). Absence
++        # restores euler, so ordinary clients are unaffected.
++        sampler = "euler"
++        if 'sampler' in observation:
++            observation = dict(observation)
++            sampler = observation.pop('sampler')
++        lingbot_introspect.set_sampler(sampler)
++
++        # Routing correction: a (36 layers, 32 experts) additive bias applied to
++        # the router scores before top-k (Qwen2TokenMoeBlock adds
++        # e_score_correction_bias at selection, ahead of the fused/eager branch,
++        # so this works under either implementation). Sent per decision; absence
++        # restores the checkpoint's own bias.
++        routing_bias = None
++        if 'routing_bias' in observation:
++            observation = dict(observation)
++            routing_bias = observation.pop('routing_bias')
++        self._apply_routing_bias(routing_bias)
 +        if want_introspect and self.use_compile:
 +            raise RuntimeError(
 +                "introspection needs --use_compile False: torch.compile traces "
@@ -138,7 +192,7 @@ index 96b9acb..bde55a6 100644
          is_batch = 'batch' in observation
          observations = observation['batch'] if is_batch else [observation]
          if not self.chunk_ret and self.use_length <= 0:
-@@ -479,8 +558,19 @@ class LingbotVLAv2Server:
+@@ -479,8 +605,19 @@ class LingbotVLAv2Server:
              or self.use_length == -1 
          )
  
@@ -159,7 +213,7 @@ index 96b9acb..bde55a6 100644
                  unnormalized_actions, normalized_actions = self._infer_batch(
                      observations,
                      return_normalized=True,
-@@ -520,8 +610,18 @@ class LingbotVLAv2Server:
+@@ -520,8 +657,18 @@ class LingbotVLAv2Server:
                  normalized_action = normalized_action[0]
  
          result = action
@@ -180,7 +234,7 @@ index 96b9acb..bde55a6 100644
  
          self.global_step += 1
 diff --git a/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py b/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
-index 44ccf04..0f3a2ec 100644
+index 44ccf04..90a53db 100644
 --- a/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
 +++ b/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
 @@ -1,3 +1,25 @@
@@ -976,11 +1030,19 @@ index 44ccf04..0f3a2ec 100644
          count = 0
          predict_velocity_fn = self.predict_velocity
          if getattr(self, "_use_compile_predict_velocity", False):
-@@ -984,9 +1208,11 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -984,9 +1208,19 @@ class FlowMatchingV2(FlowMatchingV1):
                  )
                  self._compiled_predict_velocity = predict_velocity_fn
  
-+        # 第 3 步：去噪循环。每一圈问一次「往哪挪」，然后挪一小步，直到 time 走到 0。
++        # 第 3 步：去噪循环。两种采样器，速度场的查询时间点完全相同（t=1.0…0.1）：
++        #   euler —— 原始路径：开局抽一次噪声，沿速度场逐步积分；
++        #   vine  —— VINE 采样器（arXiv 2607.10369）：每步先用「终点预测」
++        #            â = x − t·v 更新动作估计，再围绕它注入新鲜噪声重造带噪状态
++        #            x̂ = t·z + (1−t)·â。论文定理 1：对流匹配最优速度场，终点预测
++        #            对任意构造的 x 都是动作后验均值，因此预训练权重可直接使用。
++        #            第一步 t=1.0 时 x̂ 就是纯噪声，与 euler 的起点一致（钉住种子时
++        #            两种采样器的第一次查询完全相同，此后才分岔）。
++        sampler = introspect.sampler()
          while time >= -dt / 2:
              count += 1
              expanded_time = time.expand(bsize)
@@ -988,7 +1050,7 @@ index 44ccf04..0f3a2ec 100644
              v_t = predict_velocity_fn(
                  state,
                  prefix_pad_masks,
-@@ -996,24 +1222,32 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -996,24 +1230,41 @@ class FlowMatchingV2(FlowMatchingV1):
                  prefix_position_ids=prefix_position_ids,
              )
  
@@ -996,7 +1058,16 @@ index 44ccf04..0f3a2ec 100644
 -            time += dt
 +            introspect.record_denoise_step(x_t, v_t)
 +
-+            x_t += dt * v_t   # 朝这个方向挪一小步
++            if sampler == "vine":
++                a_hat = x_t - time * v_t          # 终点预测：当前对最终动作的最优估计
++                next_time = time + dt
++                if next_time >= -dt / 2:          # 还有下一步：围绕 â 重造带噪状态
++                    z_k = introspect.make_step_noise(x_t.shape, device, dtype)
++                    x_t = next_time * z_k + (1 - next_time) * a_hat
++                else:
++                    x_t = a_hat                   # 最后一步：动作估计即输出
++            else:
++                x_t += dt * v_t   # 朝这个方向挪一小步
 +            time += dt        # 时间前进一步（越来越接近成品）
          print(f"Denoise {count} steps")
 -        return x_t
@@ -1027,7 +1098,7 @@ index 44ccf04..0f3a2ec 100644
          time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
              state,
              x_t,
-@@ -1028,6 +1262,7 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -1028,6 +1279,7 @@ class FlowMatchingV2(FlowMatchingV1):
              suffix_len,
              prefix_len,
          )
@@ -1035,7 +1106,7 @@ index 44ccf04..0f3a2ec 100644
          suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
          full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
          if self.block_future_depth_to_action:
-@@ -1051,15 +1286,23 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -1051,15 +1303,23 @@ class FlowMatchingV2(FlowMatchingV1):
          )
          position_ids = full_position_ids[:, :, -suffix_len:]
  
@@ -1061,7 +1132,7 @@ index 44ccf04..0f3a2ec 100644
          suffix_out = outputs_embeds[1]
          suffix_out = suffix_out[:, -self.config.n_action_steps :]
          if getattr(self.config, "action_fp32", False):
-@@ -1070,7 +1313,19 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -1070,7 +1330,19 @@ class FlowMatchingV2(FlowMatchingV1):
              v_t = self.action_out_proj(suffix_out)
          return v_t
  
@@ -1081,7 +1152,7 @@ index 44ccf04..0f3a2ec 100644
          router_z_loss_coeff = getattr(self.config, "router_z_loss_coeff", 0)
          router_z_loss = losses.new_zeros(())
          router_z_layer_losses = None  # per-layer raw z-loss (pre-coeff), for monitoring
-@@ -1081,6 +1336,7 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -1081,6 +1353,7 @@ class FlowMatchingV2(FlowMatchingV1):
              ]
              router_z_loss = router_z_loss_coeff * torch.stack(router_z_layer_losses).mean()
  
@@ -1089,7 +1160,7 @@ index 44ccf04..0f3a2ec 100644
          seq_wise_loss_coeff = getattr(self.config, "sequence_wise_loss_coeff", 0)
          seq_wise_loss = 0
          seqwise_layer_losses = None  # per-layer raw seq-wise balance loss (pre-coeff), for monitoring
-@@ -1106,6 +1362,7 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -1106,6 +1379,7 @@ class FlowMatchingV2(FlowMatchingV1):
              if seqwise_layer_losses:
                  seq_wise_loss = seq_wise_loss_coeff * torch.stack(seqwise_layer_losses).mean()
  
@@ -1097,7 +1168,7 @@ index 44ccf04..0f3a2ec 100644
          moe_metrics = {}
          if router_logits_list:
              token_moe_layers_list = sorted(getattr(self.config, "token_moe_layers", None) or [])
-@@ -1132,11 +1389,12 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -1132,11 +1406,12 @@ class FlowMatchingV2(FlowMatchingV1):
                      else:
                          _, selected = torch.topk(routing_probs, 1, dim=-1)
                          counts = F.one_hot(selected.squeeze(-1), num_classes=num_experts).float().sum(dim=0)
@@ -1114,7 +1185,7 @@ index 44ccf04..0f3a2ec 100644
                      # entropy is rank-local (this rank's routing_probs, last micro-batch).
                      per_sample_entropy = -(routing_probs * routing_probs.clamp(min=1e-9).log()).sum(dim=-1)
                      entropy = per_sample_entropy.mean()
-@@ -1195,12 +1453,19 @@ class FlowMatchingV2(FlowMatchingV1):
+@@ -1195,12 +1470,19 @@ class FlowMatchingV2(FlowMatchingV1):
          return seq_wise_loss, router_z_loss, moe_metrics
  
  
@@ -1134,7 +1205,7 @@ index 44ccf04..0f3a2ec 100644
      def get_parallel_plan(self):
          from lingbotvla.distributed.parallel_plan import ParallelPlan
          from torch.distributed._tensor import Shard
-@@ -1212,6 +1477,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
+@@ -1212,6 +1494,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
          }
          return ParallelPlan(ep_plan=ep_plan)
  
@@ -1142,7 +1213,7 @@ index 44ccf04..0f3a2ec 100644
      @classmethod
      def get_weight_loader(cls):
          return LingBotVLAWeightLoader()
-@@ -1220,7 +1486,8 @@ class LingbotVlaV2Policy(PreTrainedModel):
+@@ -1220,7 +1503,8 @@ class LingbotVlaV2Policy(PreTrainedModel):
          super().__init__(config)
          self.config = config
          self.language_tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
@@ -1152,7 +1223,7 @@ index 44ccf04..0f3a2ec 100644
          if not getattr(self.config, "use_lm_head", False):
              del self.model.qwenvl_with_expert.qwenvl.lm_head
          del self.model.qwenvl_with_expert.qwen_expert.lm_head
-@@ -1233,6 +1500,11 @@ class LingbotVlaV2Policy(PreTrainedModel):
+@@ -1233,6 +1517,11 @@ class LingbotVlaV2Policy(PreTrainedModel):
      def get_optim_params(self) -> dict:
          return self.parameters()
  
@@ -1164,7 +1235,7 @@ index 44ccf04..0f3a2ec 100644
      def forward(
          self,
          images,
-@@ -1241,7 +1513,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
+@@ -1241,7 +1530,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
          lang_tokens,
          lang_masks,
          actions,
@@ -1173,7 +1244,7 @@ index 44ccf04..0f3a2ec 100644
          action_is_pad=None,
          noise=None,
          time=None,
-@@ -1287,21 +1559,26 @@ class LingbotVlaV2Policy(PreTrainedModel):
+@@ -1287,21 +1576,26 @@ class LingbotVlaV2Policy(PreTrainedModel):
              future_video_current_patch=future_video_current_patch,
          )
  
@@ -1205,7 +1276,7 @@ index 44ccf04..0f3a2ec 100644
          total_loss = (
              loss_vla
              + loss_depth
-@@ -1315,6 +1592,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
+@@ -1315,6 +1609,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
              loss_dict.update(moe_metrics)
          return total_loss, loss_vla, loss_depth, loss_future_depth, loss_future_video, seq_wise_loss, loss_dict, depth_preds, future_depth_preds, future_video_preds, current_video_preds
  
@@ -1213,3 +1284,24 @@ index 44ccf04..0f3a2ec 100644
      def sample_actions(self, *args, **kwargs) -> Tensor:
          return self.model.sample_actions(*args, **kwargs)
  
+diff --git a/lingbotvla/models/vla/lingbot_vla/qwen2_action_expert.py b/lingbotvla/models/vla/lingbot_vla/qwen2_action_expert.py
+index 045d7f6..d123607 100644
+--- a/lingbotvla/models/vla/lingbot_vla/qwen2_action_expert.py
++++ b/lingbotvla/models/vla/lingbot_vla/qwen2_action_expert.py
+@@ -24,6 +24,8 @@ from transformers.utils.deprecation import deprecate_kwarg
+ from transformers.activations import ACT2FN
+ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs, is_flash_attn_available
++
++from . import introspect
+ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+ from transformers.processing_utils import Unpack
+ 
+@@ -291,6 +293,7 @@ class Qwen2TokenMoeBlock(nn.Module):
+ 
+         scores_for_choice = routing_scores + self.e_score_correction_bias.unsqueeze(0)
+         _, selected_experts = torch.topk(scores_for_choice, self.top_k, dim=-1)
++        introspect.record_layer_selection(selected_experts, self.num_experts)
+         routing_weights = routing_scores.gather(1, selected_experts)
+         if self.training:
+             _update_moe_runtime_stats(self, routing_weights, selected_experts)
