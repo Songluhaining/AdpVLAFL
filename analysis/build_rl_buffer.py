@@ -40,7 +40,8 @@ def main():
         for root in cfg.roots:
             files += sorted(glob.glob(f"{root}/{task}_*/episodes/*.npz"))
         rows = {k: [] for k in
-                ("h_image", "h_lang", "h_query", "state", "chunk_norm", "chunk_exec",
+                ("h_image", "h_lang", "h_query", "h_query_tokens", "state",
+                 "chunk_norm", "chunk_exec",
                  "episode", "decision", "n_decisions", "success", "seed", "terminal")}
         n_ep = 0
         skipped = 0
@@ -62,6 +63,10 @@ def main():
                 rows["h_image"].append(z["intro_h_image"][:n])
                 rows["h_lang"].append(z["intro_h_lang"][:n])
                 rows["h_query"].append(z["intro_h_query"][:n])
+                # unpooled spatial query tokens (8 x 2560): the Phase-1 gate
+                # showed pooled means poison state-action fusion; these carry
+                # the spatial scene readout the critic actually needs
+                rows["h_query_tokens"].append(z["intro_h_query_tokens"][:n])
                 rows["state"].append(z["decision_states"][:n])
                 rows["chunk_norm"].append(z["predicted_chunks_normalized"][:n].astype(np.float16))
                 rows["chunk_exec"].append(z["predicted_chunks"][:n, :25].astype(np.float32))

@@ -94,11 +94,18 @@ def main():
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--fracs", nargs="*", type=float, default=[0.25, 0.5, 0.75, 1.0])
     ap.add_argument("--state-pca", type=int, default=256)
+    ap.add_argument("--state-feats", default="pooled", choices=["pooled", "qtokens"],
+                    help="pooled: h_image/h_lang/h_query means; qtokens: the 8 "
+                         "unpooled spatial query tokens (Phase-1 found pooled "
+                         "means poison state-action fusion)")
     cfg = ap.parse_args()
 
     for task in cfg.tasks:
         z = np.load(f"{cfg.buffer}/{task}.npz")
-        S = np.concatenate([z["h_image"], z["h_lang"], z["h_query"]], 1).astype(np.float32)
+        if cfg.state_feats == "qtokens":
+            S = z["h_query_tokens"].reshape(len(z["state"]), -1).astype(np.float32)
+        else:
+            S = np.concatenate([z["h_image"], z["h_lang"], z["h_query"]], 1).astype(np.float32)
         S = np.concatenate([S, z["state"]], 1)
         A = z["chunk_exec"].reshape(len(S), -1).astype(np.float32)
         y = z["success"].astype(np.float32)
