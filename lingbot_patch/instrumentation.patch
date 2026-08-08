@@ -1,5 +1,5 @@
 diff --git a/deploy/lingbot_vla_v2_policy.py b/deploy/lingbot_vla_v2_policy.py
-index 96b9acb..b1cbbf3 100644
+index 96b9acb..81b626b 100644
 --- a/deploy/lingbot_vla_v2_policy.py
 +++ b/deploy/lingbot_vla_v2_policy.py
 @@ -28,6 +28,7 @@ import torch.nn.functional as F
@@ -35,14 +35,42 @@ index 96b9acb..b1cbbf3 100644
          apply_lingbot_qwen3_vl_patch()
  
          self.vla = self.load_vla(path_to_pi_model)
-@@ -225,14 +237,41 @@ class LingbotVLAv2Server:
+@@ -224,15 +236,68 @@ class LingbotVLAv2Server:
+         self.use_fp32 = use_fp32
          self.action_key: str= "action"
  
++    def load_actor_lora(self, lora_path):
++        """Attach a fine-tuned LoRA (from train_actor_vine.py) to the action expert.
++
++        Injection happens after the base weights are resident, mirroring the
++        trainer, so the saved parameter names line up 1:1. Adapters are cast to
++        bf16 for inference speed; the merged output is identical up to bf16
++        rounding since LoRA is additive.
++        """
++        from peft import LoraConfig, inject_adapter_in_model
++
++        ck = torch.load(lora_path, map_location="cpu", weights_only=False)
++        rank = ck["cfg"]["rank"]
++        inject_adapter_in_model(
++            LoraConfig(r=rank, lora_alpha=2 * rank,
++                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]),
++            self.vla.model.qwenvl_with_expert.qwen_expert)
++        sd = {k: v.to(torch.bfloat16) for k, v in ck["lora"].items()}
++        missing, unexpected = self.vla.load_state_dict(sd, strict=False)
++        n_own = sum("lora" in n for n, _ in self.vla.named_parameters())
++        if unexpected or n_own != len(sd):
++            raise RuntimeError(f"LoRA load mismatch: {len(sd)} saved vs {n_own} "
++                               f"injected, unexpected={unexpected[:3]}")
++        for p in self.vla.parameters():
++            p.requires_grad_(False)
++        print(f"actor LoRA loaded: {len(sd)} tensors (rank {rank}) from {lora_path}")
++
      def load_model_weights(self, path_to_pi_model, strict=True):
 -        all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
 -        merged_weights = {}
 +        """Load the sharded checkpoint one shard at a time.
-+
+ 
+-        for file_path in tqdm(all_safetensors):
 +        The checkpoint is stored in fp32 (~25GB for the 6B model). Merging every
 +        shard into a single dict before calling ``load_state_dict`` needs that
 +        25GB *on top of* the freshly built model, which does not fit on a 32GB
@@ -56,8 +84,7 @@ index 96b9acb..b1cbbf3 100644
 +        own_state = self.vla.state_dict()
 +        missing = set(own_state.keys())
 +        unexpected = []
- 
--        for file_path in tqdm(all_safetensors):
++
 +        for file_path in tqdm(all_safetensors, desc="loading shards"):
 +            shard = {}
              with safe_open(file_path, framework="pt", device="cpu") as f:
@@ -82,7 +109,7 @@ index 96b9acb..b1cbbf3 100644
  
      def merge_qwen_config(self, qwen_config):
          if hasattr(qwen_config, 'to_dict'):
-@@ -315,7 +354,19 @@ class LingbotVLAv2Server:
+@@ -315,7 +380,19 @@ class LingbotVLAv2Server:
          
          print('Initializing model ... ')
  
@@ -103,7 +130,7 @@ index 96b9acb..b1cbbf3 100644
  
          self.load_model_weights(path_to_pi_model, strict=True)
          
-@@ -336,6 +387,33 @@ class LingbotVLAv2Server:
+@@ -336,6 +413,33 @@ class LingbotVLAv2Server:
  
          return self.vla
  
@@ -137,7 +164,7 @@ index 96b9acb..b1cbbf3 100644
      def reset(self, robo_name, path_to_pi_model = None) -> None:
          if path_to_pi_model is not None:
              self.vla = self.load_vla(path_to_pi_model)
-@@ -467,6 +545,54 @@ class LingbotVLAv2Server:
+@@ -467,6 +571,54 @@ class LingbotVLAv2Server:
              self.reset(robo_name=observation['robo_name'], path_to_pi_model=observation['path_to_pi_model'] if 'path_to_pi_model' in observation else None)
              return dict(action = None)
  
@@ -192,7 +219,7 @@ index 96b9acb..b1cbbf3 100644
          is_batch = 'batch' in observation
          observations = observation['batch'] if is_batch else [observation]
          if not self.chunk_ret and self.use_length <= 0:
-@@ -479,8 +605,19 @@ class LingbotVLAv2Server:
+@@ -479,8 +631,19 @@ class LingbotVLAv2Server:
              or self.use_length == -1 
          )
  
@@ -213,17 +240,17 @@ index 96b9acb..b1cbbf3 100644
                  unnormalized_actions, normalized_actions = self._infer_batch(
                      observations,
                      return_normalized=True,
-@@ -520,8 +657,18 @@ class LingbotVLAv2Server:
+@@ -520,8 +683,18 @@ class LingbotVLAv2Server:
                  normalized_action = normalized_action[0]
  
          result = action
 -        if return_normalized:
 +        if introspect_out:
-+            result = dict(result)
+             result = dict(result)
 +            for k, v in introspect_out.items():
 +                result[f"_introspect_{k}"] = v
 +        if return_normalized and normalized_action is not None:
-             result = dict(result)
++            result = dict(result)
 +            # Still a torch tensor at this point; the websocket packer only speaks
 +            # numpy, so convert here rather than at every call site.
 +            if isinstance(normalized_action, Tensor):
@@ -233,6 +260,30 @@ index 96b9acb..b1cbbf3 100644
              result["_normalized_actions"] = normalized_action
  
          self.global_step += 1
+@@ -590,6 +763,14 @@ def main():
+         default=True,
+     )
+ 
++    parser.add_argument(
++        "--lora_path",
++        type=str,
++        default=None,
++        help="LoRA checkpoint from train_actor_vine.py; injected into the "
++             "action expert after the base weights load",
++    )
++
+     args = parser.parse_args()
+ 
+     model = LingbotVLAv2Server(
+@@ -600,6 +781,8 @@ def main():
+         use_fp32=args.use_fp32,
+         use_compile=args.use_compile,
+     )
++    if args.lora_path:
++        model.load_actor_lora(args.lora_path)
+     model_server = WebsocketPolicyServer(model, port=args.port)
+     model_server.serve_forever()
+ 
 diff --git a/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py b/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
 index 44ccf04..90a53db 100644
 --- a/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py

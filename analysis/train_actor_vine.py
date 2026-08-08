@@ -147,8 +147,13 @@ def main():
     ap.add_argument("--critic", required=True)
     ap.add_argument("--task", default="click_bell")
     ap.add_argument("--out", default="actor_lora")
-    ap.add_argument("--alpha", type=float, default=100.0, help="BC coefficient")
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--alpha_q", type=float, default=0.2,
+                    help="TD3+BC style weight of the normalized Q term relative "
+                         "to the (spread-normalized) BC anchor")
+    ap.add_argument("--bc_scale", type=float, default=2e-4,
+                    help="typical BC value (2*sigma^2 of the policy's own real-dim "
+                         "spread); bc/bc_scale ~ 1 inside the data spread")
+    ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--accum", type=int, default=8)
@@ -213,9 +218,18 @@ def main():
             raise RuntimeError("unnormalization map varies across samples")
     W = torch.tensor(Wb[0], dtype=torch.float32, device=device)
     b = torch.tensor(Wb[1], dtype=torch.float32, device=device)
-    print(f"unnorm bridge verified (probe err {err:.2e}), output dim {W.shape[1]}", flush=True)
+    # BC only on the dims that map to real joints: the other 41 of 55 are
+    # padding, the model's output there is unconstrained noise, and averaging
+    # it into the BC loss both inflates it (~0.87 vs ~0.1) and pollutes the
+    # gradient with a signal about nothing.
+    real_dims = torch.tensor((np.abs(Wb[0]).sum(1) > 1e-9), device=device)
+    print(f"unnorm bridge verified (probe err {err:.2e}), output dim {W.shape[1]}, "
+          f"BC over {int(real_dims.sum())}/{len(real_dims)} dims", flush=True)
 
     def critic_q(chunk_norm_f32, joints_np, sp_np):
+        """Pessimistic min(Q1,Q2): with ~1k transitions the critic extrapolates
+        loosely (raw Q was seen reaching 2.0 on a [0,1]-target scale when the
+        actor pushed off-data), and the min is the standard damper."""
         a_exec = (chunk_norm_f32[0, :25].to(torch.float32) @ W + b).reshape(1, -1)
         a_std = (a_exec - cstats["a"][0]) / cstats["a"][1]
         j = (torch.tensor(joints_np, dtype=torch.float32, device=device)[None]
@@ -223,7 +237,7 @@ def main():
         sp = (torch.tensor(sp_np, dtype=torch.float32, device=device)[None]
               - cstats["sp"][0]) / cstats["sp"][1]
         q1, q2 = critic(a_std, j, sp)
-        return (q1 + q2) / 2
+        return torch.minimum(q1, q2)
 
     opt = torch.optim.AdamW(lora_params, lr=cfg.lr, weight_decay=0.0)
     gen = torch.Generator(device=device)
@@ -253,6 +267,8 @@ def main():
 
     probe("init")
     step = 0
+    q_ema = 0.25
+    bc_scale = cfg.bc_scale
     t0 = time.time()
     for epoch in range(1, cfg.epochs + 1):
         ep_order = rng.permutation(train_eps)
@@ -270,8 +286,15 @@ def main():
                     q = critic_q(a_hat, j, sp)
                     target = torch.tensor(z["predicted_chunks_normalized"][k],
                                           device=device, dtype=torch.float32)[None]
-                    bc = ((a_hat.to(torch.float32) - target) ** 2).mean()
-                    loss = (-q.squeeze() + cfg.alpha * bc) / cfg.accum
+                    bc = ((a_hat.to(torch.float32) - target) ** 2)[..., real_dims].mean()
+                    # TD3+BC balance: the policy's own spread on real dims is
+                    # tiny (bc ~1e-4), so a fixed alpha either vanishes against
+                    # Q or crushes it. Normalizing Q by its running magnitude
+                    # keeps the two gradients at a fixed ratio regardless of
+                    # where the critic's scale drifts.
+                    q_ema = 0.95 * q_ema + 0.05 * abs(float(q))
+                    lam = cfg.alpha_q / (q_ema + 1e-3)
+                    loss = (-lam * q.squeeze() + bc / bc_scale) / cfg.accum
                     loss.backward()
                     step += 1
                     done += 1
@@ -282,8 +305,8 @@ def main():
                         if (step // cfg.accum) % 10 == 0:
                             dt_s = (time.time() - t0) / done
                             print(f"ep{epoch} {done}/? q={float(q):.4f} "
-                                  f"bc={float(bc):.4f} gnorm={float(gn):.3f} "
-                                  f"{dt_s:.2f}s/dec", flush=True)
+                                  f"bc={float(bc):.5f} lam={lam:.2f} "
+                                  f"gnorm={float(gn):.3f} {dt_s:.2f}s/dec", flush=True)
                     if cfg.max_decisions and done >= cfg.max_decisions:
                         break
                 if cfg.max_decisions and done >= cfg.max_decisions:
