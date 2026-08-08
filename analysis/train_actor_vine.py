@@ -153,6 +153,8 @@ def main():
     ap.add_argument("--bc_scale", type=float, default=2e-4,
                     help="typical BC value (2*sigma^2 of the policy's own real-dim "
                          "spread); bc/bc_scale ~ 1 inside the data spread")
+    ap.add_argument("--q_cap", type=float, default=1.0,
+                    help="semantic ceiling of the value (discounted success prob)")
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=3)
@@ -284,6 +286,11 @@ def main():
                     sp = z["intro_h_query_tokens"][k].reshape(-1).astype(np.float32)
                     j = z["decision_states"][k].astype(np.float32)
                     q = critic_q(a_hat, j, sp)
+                    # Q is a discounted success probability; values above 1 are
+                    # semantically impossible and only reachable by exploiting
+                    # the critic (observed: held-out Q hit 1.41). Capping stops
+                    # the gradient from paying for impossible value.
+                    q = torch.clamp(q, max=cfg.q_cap)
                     target = torch.tensor(z["predicted_chunks_normalized"][k],
                                           device=device, dtype=torch.float32)[None]
                     bc = ((a_hat.to(torch.float32) - target) ** 2)[..., real_dims].mean()
