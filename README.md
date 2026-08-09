@@ -1,8 +1,11 @@
 # AdpVLAFL — 面向 LingBot-VLA 2.0 的失败定位与决策端优化
 
 在 RoboTwin 2.0 仿真中大规模采集 LingBot-VLA 2.0 的闭环执行数据（含模型内部量），
-用贝叶斯网络做失败归因，目标是定位决策过程中导致失败的环节并加以优化。
-方法要求跨任务通用，并最终迁移到真实机器人。
+对失败做因果归因并优化决策端。方法要求跨任务通用，并最终迁移到真实机器人。
+
+> **完整证据链见 [docs/RESEARCH_REPORT.md](docs/RESEARCH_REPORT.md)**
+> （2026-07-28 至 2026-08-09：贝叶斯归因 → VINE 采样器/离线 RL → Top-N 择优 →
+> 多抽对比验证的全部实验设计、数字、判定与方法学教训）。
 
 上游模型代码：[Robbyant/lingbot-vla-v2](https://github.com/robbyant/lingbot-vla-v2)
 仿真环境：[RoboTwin-Platform/RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin)
