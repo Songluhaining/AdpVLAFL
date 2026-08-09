@@ -74,5 +74,5 @@ run_arm() {  # arm server_extra client_extra
 }
 
 run_arm C "" ""
-run_arm T "--lora_path $LORA" "--sampler vine"
+run_arm T "--lora_path $LORA" "${T_CLIENT_ARGS:---sampler vine}"
 echo "=== done ===" | tee -a "$summary"
