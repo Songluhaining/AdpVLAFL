@@ -52,8 +52,10 @@ ADPVLAFL_ANALYSIS=/data/whn/AdpVLAFL/analysis CUDA_VISIBLE_DEVICES=0 \
         --model_path "$CKPT" --use_length 50 --use_bf16 True \
         --use_compile False --port "$PORT" --critic_path "$CRITIC" \
         > "$log_dir/server.log" 2>&1 &
-for _ in $(seq 1 120); do
-    grep -q "Model initialized" "$log_dir/server.log" && break
+# the critic loads a few seconds AFTER "Model initialized" prints, so wait for
+# its own marker instead of checking it the instant the model is up
+for _ in $(seq 1 140); do
+    grep -q "top-N critic loaded" "$log_dir/server.log" && break
     sleep 5
 done
 grep -q "top-N critic loaded" "$log_dir/server.log" || {
@@ -75,9 +77,12 @@ run_client() {  # tag extra...
     printf "%s\t%s\t%s\t%s\n" "$TASK" "$tag" "${r:--}" "$(( (t1 - t0) / 60 ))" | tee -a "$summary"
 }
 
+REPS_SCENES=${REPS_SCENES:-$SCENES}   # top-up reps may target a subset (e.g. only unlabelled failures)
 for rep in $EXTRA_REPS; do
+    SCENES_SAVE=$SCENES; SCENES=$REPS_SCENES
     run_client "rep${rep}" --noise_replicate "$rep" \
         --output_dir "$ROOT/rollouts_replicate/${TASK}_rep${rep}"
+    SCENES=$SCENES_SAVE
 done
 run_client C --noise_replicate 0 --output_dir "$ROOT/rollouts_topn/${TASK}_C"
 run_client T --noise_replicate 0 --sample_topn "$TOPN" \

@@ -93,6 +93,11 @@ def main():
     ap.add_argument("--tasks", nargs="*", default=["click_bell", "click_alarmclock"])
     ap.add_argument("--buffer", default="/data/whn/robotwin_eval/rl_buffer")
     ap.add_argument("--gamma", type=float, default=0.95)
+    ap.add_argument("--mc", action="store_true",
+                    help="Monte-Carlo targets (terminal outcome, no bootstrap): "
+                         "the TD path collapsed on click_alarmclock once the "
+                         "leaked episodes were removed, while the MC signal "
+                         "survives; for top-N ranking MC IS the wanted quantity")
     ap.add_argument("--tau", type=float, default=0.005)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--epochs", type=int, default=300)
@@ -161,8 +166,11 @@ def main():
                 bt = torch.tensor(b, device=DEV)
                 btn = torch.tensor(bn, device=DEV)
                 with torch.no_grad():
-                    q1n, q2n = qt(t["a"][btn], t["j"][btn], t["sp"][btn])
-                    y = t["r"][bt] + cfg.gamma * (1 - t["term"][bt]) * torch.minimum(q1n, q2n)
+                    if cfg.mc:
+                        y = t["y"][bt]
+                    else:
+                        q1n, q2n = qt(t["a"][btn], t["j"][btn], t["sp"][btn])
+                        y = t["r"][bt] + cfg.gamma * (1 - t["term"][bt]) * torch.minimum(q1n, q2n)
                 q1, q2 = q(t["a"][bt], t["j"][bt], t["sp"][bt])
                 loss = ((q1 - y) ** 2).mean() + ((q2 - y) ** 2).mean()
                 opt.zero_grad()
@@ -178,8 +186,11 @@ def main():
                 with torch.no_grad():
                     bt = torch.tensor(te_idx, device=DEV)
                     btn = torch.tensor(np.minimum(nxt[te_idx], len(d["y"]) - 1), device=DEV)
-                    q1n, q2n = qt(t["a"][btn], t["j"][btn], t["sp"][btn])
-                    y = t["r"][bt] + cfg.gamma * (1 - t["term"][bt]) * torch.minimum(q1n, q2n)
+                    if cfg.mc:
+                        y = t["y"][bt]
+                    else:
+                        q1n, q2n = qt(t["a"][btn], t["j"][btn], t["sp"][btn])
+                        y = t["r"][bt] + cfg.gamma * (1 - t["term"][bt]) * torch.minimum(q1n, q2n)
                     q1, q2 = q(t["a"][bt], t["j"][bt], t["sp"][bt])
                     td_te = float((((q1 - y) ** 2 + (q2 - y) ** 2) / 2).mean())
                     b0 = torch.tensor(te0, device=DEV)
