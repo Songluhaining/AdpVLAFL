@@ -33,7 +33,11 @@ def build_success_index(roots, task):
     """Successful episodes with images, plus per-scene success rate over roots."""
     eps, by_scene = [], defaultdict(list)
     for root in roots:
-        for f in sorted(glob.glob(f"{root}/{task}_*/episodes/*.npz")):
+        # corpus layout: root/<task>_<config>_<stamp>/episodes/*.npz
+        # collection layout adds one level: root/<task>_itK_rN/<task>_.../episodes/
+        files = sorted(glob.glob(f"{root}/{task}_*/episodes/*.npz")
+                       + glob.glob(f"{root}/{task}_*/*/episodes/*.npz"))
+        for f in files:
             meta = json.load(open(f.replace(".npz", ".json")))
             by_scene[int(meta["seed"])].append(bool(meta["success"]))
             if meta["success"]:

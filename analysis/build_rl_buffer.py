@@ -38,7 +38,8 @@ def main():
     for task in cfg.tasks:
         files = []
         for root in cfg.roots:
-            files += sorted(glob.glob(f"{root}/{task}_*/episodes/*.npz"))
+            files += sorted(glob.glob(f"{root}/{task}_*/episodes/*.npz")
+                            + glob.glob(f"{root}/{task}_*/*/episodes/*.npz"))
         rows = {k: [] for k in
                 ("h_image", "h_lang", "h_query", "h_query_tokens", "state",
                  "chunk_norm", "chunk_exec",

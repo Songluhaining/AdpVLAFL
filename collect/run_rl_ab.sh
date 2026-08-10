@@ -59,10 +59,13 @@ run_arm() {  # arm server_extra client_extra
     done
     cd "$ROOT/RoboTwin" || exit 1
     local t0=$(date +%s)
+    # SCENES (json list) replays a labelled scene set; otherwise the seed walk
+    local scene_args="--test_num $N --seed $SEED"
+    [ -n "${SCENES:-}" ] && scene_args="--scene_seeds_file $SCENES"
     CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
         "$CONDA/envs/robotwin/bin/python" -u script/eval_lingbot_vla.py \
             --task_name "$TASK" --task_config demo_randomized --port "$PORT" \
-            --test_num "$N" --seed "$SEED" --exec_horizon 25 \
+            $scene_args --exec_horizon 25 \
             --instruction_type unseen --fixed_noise --noise_replicate 0 \
             --no_log_introspect --no_save_images $client_extra \
             --output_dir "$ROOT/rollouts_rl_ab/${TASK}_${arm}" \
@@ -74,5 +77,5 @@ run_arm() {  # arm server_extra client_extra
 }
 
 run_arm C "" ""
-run_arm T "--lora_path $LORA" "${T_CLIENT_ARGS:---sampler vine}"
+run_arm T "--lora_path $LORA" "${T_CLIENT_ARGS---sampler vine}"
 echo "=== done ===" | tee -a "$summary"

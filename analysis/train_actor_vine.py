@@ -48,7 +48,9 @@ CAM_KEYS = {
 def build_index(rollouts, task):
     """(npz_path, meta, decision_idx) for every decision that has images."""
     idx = []
-    for f in sorted(glob.glob(f"{rollouts}/{task}_*/episodes/*.npz")):
+    files = sorted(glob.glob(f"{rollouts}/{task}_*/episodes/*.npz")
+                   + glob.glob(f"{rollouts}/{task}_*/*/episodes/*.npz"))
+    for f in files:
         with np.load(f) as z:
             if "decision_images_head_camera" not in z.files:
                 continue

@@ -14,6 +14,9 @@ SEED=${SEED:-21}
 K=${K:-3}
 ITER=${ITER:?iteration tag, e.g. 1}
 LORA=${LORA:-}          # empty = base policy (iteration 1 collects under base+iter0 LoRA etc.)
+SAMPLER=${SAMPLER:-}    # "vine" for online-VINE rounds (generation matched to training)
+INTROSPECT=${INTROSPECT:-0}   # 1 = record model internals (the critic's features)
+OUTROOT=${OUTROOT:-rollouts_selfimit}
 PORT=${PORT:-9500}
 
 stamp=$(date +%Y%m%d_%H%M%S)
@@ -47,6 +50,9 @@ for _ in $(seq 1 140); do
 done
 
 cd "$ROOT/RoboTwin" || exit 1
+client_extra=""
+[ -n "$SAMPLER" ] && client_extra="--sampler $SAMPLER"
+[ "$INTROSPECT" = 1 ] || client_extra="$client_extra --no_log_introspect"
 for task in $TASKS; do
     for k in $(seq 0 $((K - 1))); do
         t0=$(date +%s)
@@ -54,8 +60,8 @@ for task in $TASKS; do
             "$CONDA/envs/robotwin/bin/python" -u script/eval_lingbot_vla.py \
                 --task_name "$task" --task_config demo_randomized --port "$PORT" \
                 --test_num "$N" --seed "$SEED" --exec_horizon 25 \
-                --instruction_type unseen --no_log_introspect \
-                --output_dir "$ROOT/rollouts_selfimit/${task}_it${ITER}_r${k}" \
+                --instruction_type unseen $client_extra \
+                --output_dir "$ROOT/${OUTROOT}/${task}_it${ITER}_r${k}" \
                 > "$log_dir/${task}_r${k}.log" 2>&1
         t1=$(date +%s)
         r=$(grep -oP 'FINAL Success rate: \K\d+/\d+' "$log_dir/${task}_r${k}.log" | tail -1)
